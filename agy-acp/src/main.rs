@@ -101,24 +101,6 @@ impl Adapter {
     }
 
     /// Persist session store with exclusive lock and atomic write.
-    fn save_store(&self, store: &SessionStore) {
-        if let Some(parent) = self.state_file.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let Some(_lock) = self.lock_state_file() else {
-            eprintln!("[agy-acp] WARN: failed to lock state file");
-            return;
-        };
-        let tmp = self.state_file.with_extension("tmp");
-        let Ok(file) = fs::File::create(&tmp) else {
-            eprintln!("[agy-acp] WARN: failed to create state file");
-            return;
-        };
-        if serde_json::to_writer_pretty(&file, store).is_ok() {
-            let _ = fs::rename(&tmp, &self.state_file);
-        }
-    }
-
     /// Try to restore conversation_id from persisted state.
     fn restore_session(&self, session_id: &str) -> Option<String> {
         let store = self.load_store();
@@ -210,7 +192,7 @@ impl Adapter {
 
     fn handle_session_new(&mut self, id: u64) -> JsonRpcResponse {
         let session_id = Uuid::new_v4().to_string();
-        // Evict oldest sessions if at capacity (prevent unbounded growth)
+        // Evict an arbitrary session if at capacity (prevent unbounded growth)
         const MAX_SESSIONS: usize = 64;
         while self.sessions.len() >= MAX_SESSIONS {
             if let Some(key) = self.sessions.keys().next().cloned() {
