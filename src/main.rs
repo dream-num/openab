@@ -512,14 +512,14 @@ async fn main() -> anyhow::Result<()> {
     for d in dispatchers.lock().unwrap().iter() {
         d.shutdown();
     }
-    // Run pre_shutdown hook (backup state, sync to S3, etc.)
+    let shutdown_pool = pool;
+    shutdown_pool.shutdown().await;
+    // Run pre_shutdown hook after pool shutdown to guarantee no active sessions are writing.
     if let Some(ref hook) = shutdown_hook {
         if let Err(e) = hooks::run_hook("pre_shutdown", hook).await {
             error!(error = %e, "pre_shutdown hook failed");
         }
     }
-    let shutdown_pool = pool;
-    shutdown_pool.shutdown().await;
     info!("openab shut down");
     Ok(())
 }

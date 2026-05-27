@@ -5,6 +5,9 @@ use std::path::PathBuf;
 use tokio::process::Command;
 use tracing::{error, info, warn};
 
+/// Maximum size for a remote hook script (1 MiB).
+const MAX_SCRIPT_SIZE: usize = 1024 * 1024;
+
 /// Run a hook. Returns Ok(()) if the hook succeeds or is not configured.
 /// Returns Err only if on_failure=abort and the hook fails.
 pub async fn run_hook(name: &str, hook: &HookConfig) -> anyhow::Result<()> {
@@ -91,18 +94,25 @@ async fn resolve_script(name: &str, hook: &HookConfig) -> anyhow::Result<Resolve
 }
 
 fn write_temp_script(name: &str, content: &str) -> anyhow::Result<PathBuf> {
-    let id = uuid::Uuid::new_v4();
-    let path = std::env::temp_dir().join(format!("openab-hook-{name}-{id}.sh"));
-    let mut f = std::fs::File::create(&path)?;
-    f.write_all(content.as_bytes())?;
-    drop(f);
+    #[cfg(unix)]
+    let suffix = ".sh";
+    #[cfg(windows)]
+    let suffix = ".cmd";
+
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&format!("openab-hook-{name}-")).suffix(suffix);
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
     }
 
+    let mut f = builder.tempfile()?;
+    f.write_all(content.as_bytes())?;
+    let path = f.into_temp_path().keep().map_err(|e| {
+        anyhow::anyhow!("failed to persist temp script: {}", e.error)
+    })?;
     Ok(path)
 }
 
@@ -115,17 +125,29 @@ async fn fetch_and_verify(url: &str, expected_hex: &str) -> anyhow::Result<Strin
     if !resp.status().is_success() {
         anyhow::bail!("hook url returned HTTP {}", resp.status());
     }
-    let body = resp.text().await?;
+    let content_length = resp.content_length().unwrap_or(0) as usize;
+    if content_length > MAX_SCRIPT_SIZE {
+        anyhow::bail!(
+            "hook script too large: {content_length} bytes (max {MAX_SCRIPT_SIZE})"
+        );
+    }
+    let body = resp.bytes().await?;
+    if body.len() > MAX_SCRIPT_SIZE {
+        anyhow::bail!(
+            "hook script too large: {} bytes (max {MAX_SCRIPT_SIZE})",
+            body.len()
+        );
+    }
 
     let mut hasher = Sha256::new();
-    hasher.update(body.as_bytes());
+    hasher.update(&body);
     let actual_hex = format!("{:x}", hasher.finalize());
 
     if actual_hex != expected_hex.to_lowercase() {
         anyhow::bail!("hook sha256 mismatch: expected {expected_hex}, got {actual_hex}");
     }
 
-    Ok(body)
+    Ok(String::from_utf8(body.to_vec())?)
 }
 
 async fn execute(path: &PathBuf, timeout_secs: u64) -> anyhow::Result<()> {
@@ -156,6 +178,25 @@ async fn execute(path: &PathBuf, timeout_secs: u64) -> anyhow::Result<()> {
         }
         if let Ok(v) = std::env::var("SystemDrive") {
             cmd.env("SystemDrive", &v);
+        }
+    }
+
+    // Pass through cloud credential env vars for IAM-based auth (IRSA, Workload Identity, ECS task role)
+    for (key, val) in std::env::vars() {
+        let dominated = key.starts_with("AWS_")
+            || key.starts_with("AMAZON_")
+            || key.starts_with("ECS_CONTAINER_METADATA_URI")
+            || key.starts_with("GOOGLE_")
+            || key.starts_with("GCLOUD_")
+            || key.starts_with("CLOUDSDK_")
+            || key.starts_with("AZURE_")
+            || key == "BOOTSTRAP_URI"
+            || key == "BOOTSTRAP_BASE_URI"
+            || key == "BOOTSTRAP_PERSONAL_URI"
+            || key == "STATE_BUCKET"
+            || key == "TASK_FAMILY";
+        if dominated {
+            cmd.env(&key, &val);
         }
     }
 
