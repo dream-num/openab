@@ -13,7 +13,7 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | 
 
 ## Quick Start (Local Docker)
 
-The following is a single copy-pasteable sequence. Run all commands on the host unless noted otherwise.
+The following is a single copy-pasteable sequence. All commands run **on the host** unless prefixed with `sandbox$`.
 
 ```bash
 # 1. Create credential providers
@@ -29,14 +29,42 @@ openshell provider create --name github --env GITHUB_TOKEN
 openshell provider create --name anthropic --env ANTHROPIC_API_KEY
 
 # 2. Create sandbox with providers and port forwarding
+#    This starts an isolated container and drops you into a bash shell inside it.
+#    The sandbox runs until you `exit` or delete it from the host.
 openshell sandbox create --name oab \
   --provider discord \
   --provider github \
   --provider anthropic \
   --forward 3000 \
   -- bash
+```
 
-# 3. Apply network policy (all unlisted egress is denied by default)
+At this point you are **inside the sandbox** (prompt changes). To return to the host, type `exit`. To reconnect later: `openshell sandbox connect oab`.
+
+```bash
+# 3. (Inside sandbox) Clone and build OAB
+sandbox$ git clone https://github.com/openabdev/openab.git
+sandbox$ cd openab
+sandbox$ cargo build --release
+
+# 4. (Inside sandbox) Create config.toml
+sandbox$ cp config.toml.example config.toml
+sandbox$ sed -i 's/allowed_channels = \["1234567890"\]/allowed_channels = ["YOUR_CHANNEL_ID"]/' config.toml
+```
+
+Edit `config.toml` to set your Discord channel ID. The env vars (`DISCORD_BOT_TOKEN`, etc.) are already injected by the provider — no need to set them manually.
+
+```bash
+# 5. (Inside sandbox) Run OAB
+sandbox$ ./target/release/openab serve --config config.toml
+```
+
+### Applying network policy (from a separate host terminal)
+
+Open a new terminal on the host while OAB is running:
+
+```bash
+# All unlisted egress is denied by default.
 cat > /tmp/oab-policy.yaml <<'EOF'
 network:
   egress:
@@ -52,21 +80,9 @@ network:
       ports: [443]
 EOF
 openshell policy set oab --policy /tmp/oab-policy.yaml --wait
-
-# 4. Connect to the sandbox
-openshell sandbox connect oab
 ```
 
-Inside the sandbox:
-
-```bash
-git clone https://github.com/openabdev/openab.git
-cd openab
-cargo build --release
-./target/release/openab serve --config config.toml
-```
-
-At this point `localhost:3000` on the host reaches port 3000 inside the sandbox (useful for GitHub webhook delivery via grok/ngrok).
+> **DNS note:** OpenShell resolves hostnames in `destination` via the sandbox's DNS at policy evaluation time. Wildcard subdomains (e.g., `*.discord.com`) are not supported — list each hostname explicitly. If a service uses multiple domains, check its docs for the full list.
 
 ## Credential Management
 
@@ -109,7 +125,6 @@ RUN apt-get update && apt-get install -y \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     su sandbox -c 'sh -s -- -y'
 
-# Pre-clone and build OAB
 USER sandbox
 WORKDIR /home/sandbox
 RUN . /home/sandbox/.cargo/env && \
@@ -137,7 +152,9 @@ openshell sandbox connect oab
 Inside the sandbox, OAB is already built:
 
 ```bash
-./target/release/openab serve --config config.toml
+sandbox$ cp config.toml.example config.toml
+# Edit config.toml with your channel ID
+sandbox$ ./target/release/openab serve --config config.toml
 ```
 
 ## Cleanup
