@@ -11,7 +11,7 @@
 
 ### 1.1 Problem
 
-A single OAB bot instance may serve multiple projects, each with its own steering files, skills, and workspace context. Today, there is no mechanism for a user to specify session-level parameters (working directory, model, language) when initiating a conversation. The bot always starts with its default configuration, requiring manual reconfiguration or separate bot instances per project.
+A single OAB bot instance may serve multiple projects, each with its own steering files, skills, and workspace context. Today, there is no mechanism for a user to specify session-level parameters (working directory, model) when initiating a conversation. The bot always starts with its default configuration, requiring manual reconfiguration or separate bot instances per project.
 
 ### 1.2 Existing Pattern
 
@@ -77,7 +77,6 @@ The directive parser runs **before** the message enters the agent pipeline. It o
 | `[[ws:/path]]` | Set session working directory; loads steering/skills from that path | `[[ws:~/projects/myapp]]` |
 | `[[title:...]]` | Set initial thread title | `[[title:Bug triage #42]]` |
 | `[[model:...]]` | Specify model for this session | `[[model:claude-sonnet-4-20250514]]` |
-| `[[lang:...]]` | Force response language | `[[lang:en]]` |
 
 ### 3.1 `[[ws:/path]]` — Workspace
 
@@ -97,12 +96,6 @@ The directive parser runs **before** the message enters the agent pipeline. It o
 - Value must match a configured model identifier
 - If the model is unavailable or unknown, the session falls back to the default model and logs a warning
 - Does not persist beyond the session
-
-### 3.4 `[[lang:...]]` — Response Language
-
-- IETF language tag (e.g., `en`, `zh-TW`, `ja`)
-- Applied as a system-level instruction to the agent
-- Does not affect directive parsing or log language
 
 ---
 
@@ -173,11 +166,10 @@ For multi-value keys (e.g., `[[label:a]] [[label:b]]`), a future revision may in
 4. Wire `[[title:...]]` to thread title initialization
 5. Unit tests for parser edge cases (nested brackets, escaped content, empty values)
 
-### Phase 2: `model` + `lang`
+### Phase 2: `model`
 
 1. Wire `[[model:...]]` to model selection in agent runtime
-2. Wire `[[lang:...]]` to system prompt language instruction
-3. Validation and fallback logic
+2. Validation and fallback logic
 
 ### Phase 3: `/new` Slash Command
 
