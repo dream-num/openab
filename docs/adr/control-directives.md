@@ -80,15 +80,15 @@ The directive parser runs **before** the message enters the agent pipeline. It o
 
 ### 3.1 `[[ws:/path]]` — Workspace
 
-- Resolves `~` to the bot's home directory
 - Loads `AGENTS.md`, `.kiro/steering/`, and skill definitions from the target path
-- If the path does not exist, session starts with default context (no error surfaced to user; logged at warn level)
-- **Security boundary:** bot home subtree only. Enforcement:
-  1. Path must be absolute or start with `~` (relative paths rejected)
-  2. Resolve `~` → bot home, then `canonicalize()` (resolves symlinks, `..`, `.`)
-  3. Final canonical path MUST be a descendant of bot home directory
-  4. Symlinks that escape bot home are rejected after canonicalization
-  5. Violation → session fails with user-visible error, not silent fallback
+- If the path does not exist, session fails with user-visible error
+- **Security boundary — bot home subtree only.** Enforcement order:
+  1. Reject if path is relative (does not start with `~` or `/`)
+  2. Expand `~` → bot home directory
+  3. Canonicalize (resolve symlinks, `..`, `.`) via `std::fs::canonicalize()` or equivalent
+  4. Verify canonical path starts with bot home root (`canonical.starts_with(bot_home)`)
+  5. **Reject** if outside bot home — session does not start, user-visible error returned
+- Workspace steering defines repo context (remote URL, branch, etc.) — no separate repo binding needed in Phase 1
 
 ### 3.2 `[[title:...]]` — Thread Title
 
@@ -99,7 +99,7 @@ The directive parser runs **before** the message enters the agent pipeline. It o
 ### 3.3 `[[model:...]]` — Model Selection
 
 - Value must match a configured model identifier
-- If the model is unavailable or unknown, the session **fails with a user-visible error** — never silently falls back to default. Rationale: silent fallback can route an entire conversation through the wrong model without the user noticing
+- If the model is unavailable or unknown, the session is **rejected before any agent/runtime initialization** — user receives an error, no partial state is created
 - Does not persist beyond the session
 
 ---
