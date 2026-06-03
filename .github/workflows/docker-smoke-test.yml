@@ -20,11 +20,22 @@ jobs:
           docker cp "$CID:/build/target/release/openab" openab
           docker rm "$CID"
 
-      - name: Upload binary
+      - name: Build agy-acp adapter (for Dockerfile.antigravity)
+        run: |
+          if [ -f Dockerfile.antigravity ]; then
+            DOCKER_BUILDKIT=1 docker build --target adapter-builder -t agy-acp-builder -f Dockerfile.antigravity .
+            CID=$(docker create agy-acp-builder)
+            docker cp "$CID:/build/target/release/agy-acp" agy-acp
+            docker rm "$CID"
+          fi
+
+      - name: Upload binaries
         uses: actions/upload-artifact@v4
         with:
           name: openab-binary
-          path: openab
+          path: |
+            openab
+            agy-acp
           retention-days: 1
 
   smoke-test:
@@ -60,11 +71,28 @@ jobs:
           chmod +x .pre-built/openab
           DF="${{ matrix.variant.dockerfile }}"
 
-          # Replace builder stage with one that just copies the pre-built binary
           if grep -q "FROM rust" "$DF"; then
-            sed '/^FROM rust/,/^FROM [^r]/{ /^FROM [^r]/!d; }' "$DF" > Dockerfile.ci
-            sed -i '1i FROM debian:bookworm-slim AS builder\nRUN mkdir -p /build/target/release\nCOPY .pre-built/openab /build/target/release/openab' Dockerfile.ci
-            docker build -t openab-test${{ matrix.variant.suffix }} -f Dockerfile.ci .
+            # Remove ALL 'FROM rust' stages, keep only the final runtime stage
+            awk '
+              /^FROM rust/ { skip=1; next }
+              /^FROM / && !/^FROM rust/ { skip=0 }
+              !skip { print }
+            ' "$DF" > Dockerfile.ci
+
+            # Prepend stub builder stages that just provide the pre-built binaries
+            {
+              echo "FROM debian:bookworm-slim AS builder"
+              echo "RUN mkdir -p /build/target/release"
+              echo "COPY .pre-built/openab /build/target/release/openab"
+              # Handle additional build stages (e.g. adapter-builder)
+              grep -oP '(?<=AS )[\w-]+' "$DF" | grep -v '^builder$' | while read stage; do
+                echo "FROM debian:bookworm-slim AS $stage"
+                echo "RUN mkdir -p /build/target/release"
+                echo "COPY .pre-built/* /build/target/release/"
+              done
+              cat Dockerfile.ci
+            } > Dockerfile.final
+            docker build -t openab-test${{ matrix.variant.suffix }} -f Dockerfile.final .
           else
             docker build -t openab-test${{ matrix.variant.suffix }} -f "$DF" .
           fi
