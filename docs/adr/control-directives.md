@@ -30,7 +30,8 @@ Introduce **Control Directives** — `[[key:value]]` patterns in user messages t
 ### 2.1 Syntax
 
 ```
-@Bot [[ws:~/workdir/foo]] [[title:PR review]] investigate this build failure
+@Bot [[ws:~/workdir/foo]] [[title:PR review]]
+investigate this build failure
 ```
 
 ### 2.2 Core Rules
@@ -38,12 +39,13 @@ Introduce **Control Directives** — `[[key:value]]` patterns in user messages t
 | Rule | Behavior |
 |------|----------|
 | **Scope** | Processed only on the session's first message (the one that mentions/triggers the bot) |
-| **Parsing** | Extract all `[[key:value]]` matches from the message body |
-| **Stripping** | Directives are removed from the message; remaining text becomes the prompt |
+| **Parsing** | Extract a leading control header only: directives immediately after the trigger/mention and before normal prompt text |
+| **Stop condition** | The first non-directive token or line starts prompt content; later `[[key:value]]` text is preserved verbatim |
+| **Stripping** | Header directives are removed from the message; remaining text becomes the prompt |
 | **Duplicate keys** | Last value wins |
 | **Unknown keys** | Silently ignored (forward compatible) |
-| **Placement** | Inline or on separate lines — parser handles both |
-| **Empty value** | `[[key:]]` is valid; treated as explicit empty/reset |
+| **Placement** | Directives may be adjacent on the trigger line or on following header lines before prompt content begins |
+| **Empty value** | Behavior is directive-specific: empty `ws` and `model` are invalid; empty `title` means "use generated title" |
 
 ### 2.3 Architecture Position
 
@@ -52,7 +54,7 @@ User message
      │
      ▼
 ┌─────────────────────┐
-│  Directive Parser    │  ← extracts [[key:value]], strips from message
+│  Directive Parser    │  ← extracts leading [[key:value]] header, strips it
 │  (middleware)        │
 └─────────────────────┘
      │
@@ -76,7 +78,6 @@ The directive parser runs **before** the message enters the agent pipeline. It o
 |-----------|---------|---------|
 | `[[ws:/path]]` | Set session working directory; loads steering/skills from that path | `[[ws:~/projects/myapp]]` |
 | `[[title:...]]` | Set initial thread title | `[[title:Bug triage #42]]` |
-| `[[model:...]]` | Specify model for this session | `[[model:claude-sonnet-4-20250514]]` |
 
 ### 3.1 `[[ws:/path]]` — Workspace
 
@@ -85,9 +86,10 @@ The directive parser runs **before** the message enters the agent pipeline. It o
 - **Security boundary — bot home subtree only.** Enforcement order:
   1. Reject if path is relative (does not start with `~` or `/`)
   2. Expand `~` → bot home directory
-  3. Canonicalize (resolve symlinks, `..`, `.`) via `std::fs::canonicalize()` or equivalent
+  3. Canonicalize both the bot home root and target path (resolve symlinks, `..`, `.`) via `std::fs::canonicalize()` or equivalent
   4. Verify canonical path starts with bot home root (`canonical.starts_with(bot_home)`)
   5. **Reject** if outside bot home — session does not start, user-visible error returned
+- The canonical workspace is stored in `SessionMetadata` and reused for session creation, session load/resume, eviction rebuilds, and any persisted session mapping. A `[[ws:...]]` session must never resume in the configured default working directory unless that was the resolved workspace.
 - Workspace steering defines repo context (remote URL, branch, etc.) — no separate repo binding needed in Phase 1
 
 ### 3.2 `[[title:...]]` — Thread Title
@@ -98,8 +100,10 @@ The directive parser runs **before** the message enters the agent pipeline. It o
 
 ### 3.3 `[[model:...]]` — Model Selection
 
+Phase 2 adds `[[model:...]]` after the parser, workspace, and title path are implemented.
+
 - Value must match a configured model identifier
-- If the model is unavailable or unknown, the session is **rejected before any agent/runtime initialization** — user receives an error, no partial state is created
+- If the model is unavailable or unknown, the session is rejected after runtime config discovery but before the user's first prompt is sent. The user receives an error and no user task is executed in the wrong model.
 - Does not persist beyond the session
 
 ---
@@ -138,6 +142,8 @@ Control directives are platform-agnostic text — they work on Discord, Slack, T
 
 Shared syntax reduces cognitive load. The direction is unambiguous from context (who authored the message).
 
+Control directives intentionally do **not** scan the entire message body. This mirrors the output directive header concept and avoids corrupting normal prompts that quote code, issue templates, or examples containing `[[key:value]]`.
+
 ### 4.4 Security Considerations
 
 - `[[ws:...]]` enforces bot home subtree only — canonicalize, reject symlink escapes (see §3.1)
@@ -173,14 +179,15 @@ For multi-value keys (e.g., `[[label:a]] [[label:b]]`), a future revision may in
 
 1. Implement directive parser as a middleware in the message ingestion pipeline
 2. Define `SessionMetadata` struct
-3. Wire `[[ws:...]]` to workspace/context loading
-4. Wire `[[title:...]]` to thread title initialization
-5. Unit tests for parser edge cases (nested brackets, escaped content, empty values)
+3. Persist `SessionMetadata` per session key so workspace survives reconnect, resume, and eviction rebuilds
+4. Wire `[[ws:...]]` to workspace/context loading
+5. Wire `[[title:...]]` to thread title initialization
+6. Unit tests for parser edge cases (nested brackets, escaped content, empty values, body text that contains directive-like literals)
 
 ### Phase 2: `model`
 
 1. Wire `[[model:...]]` to model selection in agent runtime
-2. Validation and fallback logic
+2. Validate against runtime config options before the first user prompt is sent; reject unknown values instead of falling back silently
 
 ### Phase 3: `/new` Slash Command
 
