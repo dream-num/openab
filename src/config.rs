@@ -361,6 +361,8 @@ pub struct AgentConfig {
     #[serde(default = "default_working_dir")]
     pub working_dir: String,
     #[serde(default)]
+    pub per_session_working_dir: bool,
+    #[serde(default)]
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub inherit_env: Vec<String>,
@@ -740,8 +742,23 @@ command = "echo"
         let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
         assert_eq!(cfg.discord.unwrap().bot_token, "test-token");
         assert_eq!(cfg.agent.command, "echo");
+        assert!(!cfg.agent.per_session_working_dir);
         assert_eq!(cfg.pool.max_sessions, 10);
         assert!(cfg.reactions.enabled);
+    }
+
+    #[test]
+    fn parse_agent_per_session_working_dir() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+per_session_working_dir = true
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(cfg.agent.per_session_working_dir);
     }
 
     #[test]

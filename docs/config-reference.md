@@ -98,6 +98,7 @@ The AI agent subprocess that OpenAB spawns to handle messages via ACP.
 | `command` | string | *required* | Agent binary (e.g. `kiro-cli`, `claude-agent-acp`, `codex`, `gemini`, `copilot`, `opencode`, `pi-acp`, `cursor-agent`). |
 | `args` | string[] | `[]` | CLI arguments passed to the agent. |
 | `working_dir` | string | `"/tmp"` | Working directory for the agent process. |
+| `per_session_working_dir` | bool | `false` | When `true`, OpenAB creates a stable per-session subdirectory under `working_dir` and uses that as the agent cwd. Discord threads become paths like `working_dir/discord_<thread_id>`. |
 | `env` | map | `{}` | Extra environment variables (e.g. `{ OPENAI_API_KEY = "${OPENAI_API_KEY}" }`). |
 | `inherit_env` | string[] | `[]` | Env var names to inherit from the OAB process (e.g. vars injected via K8s `envFrom`). Keys in `env` take precedence. |
 
@@ -111,6 +112,7 @@ The AI agent subprocess that OpenAB spawns to handle messages via ACP.
 command = "kiro-cli"
 args = ["acp", "--trust-all-tools"]
 working_dir = "/home/agent"
+# per_session_working_dir = true
 
 # Claude Code
 [agent]

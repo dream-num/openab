@@ -109,6 +109,23 @@ impl SessionPool {
         }
     }
 
+    fn resolve_working_dir(&self, thread_id: &str) -> Result<String> {
+        if !self.config.per_session_working_dir {
+            return Ok(self.config.working_dir.clone());
+        }
+
+        let resolved =
+            PathBuf::from(&self.config.working_dir).join(sanitize_session_dir_component(thread_id));
+        std::fs::create_dir_all(&resolved).map_err(|e| {
+            anyhow!(
+                "failed to create per-session working_dir {}: {}",
+                resolved.display(),
+                e
+            )
+        })?;
+        Ok(resolved.to_string_lossy().into_owned())
+    }
+
     pub async fn get_or_create(&self, thread_id: &str) -> Result<()> {
         let create_gate = {
             let mut state = self.state.write().await;
@@ -171,10 +188,12 @@ impl SessionPool {
 
         // Build the replacement connection outside the state lock so one stuck
         // initialization does not block all unrelated sessions.
+        let resolved_working_dir = self.resolve_working_dir(thread_id)?;
+
         let mut new_conn = AcpConnection::spawn(
             &self.config.command,
             &self.config.args,
-            &self.config.working_dir,
+            &resolved_working_dir,
             &self.config.env,
             &self.config.inherit_env,
         )
@@ -185,7 +204,7 @@ impl SessionPool {
         let mut resumed = false;
         if let Some(ref sid) = saved_session_id {
             if new_conn.supports_load_session {
-                match new_conn.session_load(sid, &self.config.working_dir).await {
+                match new_conn.session_load(sid, &resolved_working_dir).await {
                     Ok(()) => {
                         info!(thread_id, session_id = %sid, "session resumed via session/load");
                         resumed = true;
@@ -198,7 +217,7 @@ impl SessionPool {
         }
 
         if !resumed {
-            new_conn.session_new(&self.config.working_dir).await?;
+            new_conn.session_new(&resolved_working_dir).await?;
             // Surface the reset banner both for restored sessions and for stale
             // live entries that died before we could recover a resumable
             // session id. In both cases the caller is continuing after an
@@ -475,10 +494,32 @@ impl SessionPool {
     }
 }
 
+fn sanitize_session_dir_component(thread_id: &str) -> String {
+    let mut sanitized = String::with_capacity(thread_id.len());
+    for ch in thread_id.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+
+    let trimmed = sanitized.trim_matches('_');
+    if trimmed.is_empty() {
+        "session".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{get_or_insert_gate, remove_if_same_handle};
+    use super::{
+        get_or_insert_gate, remove_if_same_handle, sanitize_session_dir_component, SessionPool,
+    };
+    use crate::config::AgentConfig;
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -540,5 +581,60 @@ mod tests {
             roundtrip.get("suspended-thread"),
             Some(&"session-suspended".to_string())
         );
+    }
+
+    #[test]
+    fn sanitize_session_dir_component_replaces_separators() {
+        assert_eq!(
+            sanitize_session_dir_component("discord:1234567890"),
+            "discord_1234567890"
+        );
+        assert_eq!(
+            sanitize_session_dir_component("slack:C0123/U0456"),
+            "slack_C0123_U0456"
+        );
+    }
+
+    #[test]
+    fn resolve_working_dir_uses_base_dir_by_default() {
+        let pool = SessionPool::new(
+            AgentConfig {
+                command: "echo".into(),
+                args: vec![],
+                working_dir: "/tmp/openab-working-dir".into(),
+                per_session_working_dir: false,
+                env: HashMap::new(),
+                inherit_env: vec![],
+            },
+            1,
+        );
+
+        let resolved = pool
+            .resolve_working_dir("discord:123")
+            .expect("resolve default working dir");
+        assert_eq!(resolved, "/tmp/openab-working-dir");
+    }
+
+    #[test]
+    fn resolve_working_dir_creates_per_session_subdirectory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = SessionPool::new(
+            AgentConfig {
+                command: "echo".into(),
+                args: vec![],
+                working_dir: tmp.path().to_string_lossy().into_owned(),
+                per_session_working_dir: true,
+                env: HashMap::new(),
+                inherit_env: vec![],
+            },
+            1,
+        );
+
+        let resolved = pool
+            .resolve_working_dir("discord:123")
+            .expect("resolve per-session working dir");
+        let expected = tmp.path().join("discord_123");
+        assert_eq!(PathBuf::from(&resolved), expected);
+        assert!(expected.is_dir());
     }
 }

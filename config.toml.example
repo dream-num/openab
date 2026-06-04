@@ -51,6 +51,8 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 command = "kiro-cli"
 args = ["acp", "--trust-all-tools"]
 working_dir = "/home/agent"
+# per_session_working_dir = true       # false (default) = one shared cwd
+#                                      # true = create working_dir/<platform>_<thread-or-channel-id>
 
 # [agent]
 # command = "claude-agent-acp"

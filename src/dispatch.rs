@@ -1064,6 +1064,7 @@ mod tests {
             command: "/bin/true".into(),
             args: vec![],
             working_dir: "/tmp".into(),
+            per_session_working_dir: false,
             env: std::collections::HashMap::new(),
             inherit_env: vec![],
         };
