@@ -357,44 +357,6 @@ tests:
               secretName: cloudflared-creds
         documentIndex: 0
 
-  - it: mounts shared data pvc and writable tmp when persistence is enabled
-    set:
-      agents.kiro.gateway.enabled: true
-      agents.kiro.gateway.url: "ws://openab-gateway:8080/ws"
-      agents.kiro.persistence.enabled: true
-    asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: HOME
-            value: /home/agent
-        documentIndex: 0
-      - contains:
-          path: spec.template.spec.containers[0].volumeMounts
-          content:
-            name: data
-            mountPath: /home/agent
-        documentIndex: 0
-      - contains:
-          path: spec.template.spec.containers[0].volumeMounts
-          content:
-            name: tmp
-            mountPath: /tmp
-        documentIndex: 0
-      - contains:
-          path: spec.template.spec.volumes
-          content:
-            name: data
-            persistentVolumeClaim:
-              claimName: RELEASE-NAME-openab-kiro
-        documentIndex: 0
-      - contains:
-          path: spec.template.spec.volumes
-          content:
-            name: tmp
-            emptyDir: {}
-        documentIndex: 0
-
   - it: renders nodeSelector when set
     set:
       agents.kiro.gateway.enabled: true

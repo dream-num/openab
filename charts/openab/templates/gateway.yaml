@@ -4,7 +4,6 @@
 {{- $gwCfg := omit $cfg "nameOverride" }}
 {{- $d := dict "ctx" $ "agent" (printf "%s-gateway" $name) "cfg" $gwCfg }}
 {{- $agentD := dict "ctx" $ "agent" $name "cfg" $cfg }}
-{{- $pvcEnabled := and $cfg.persistence $cfg.persistence.enabled }}
 {{- $hasTeams := and (($cfg.gateway).teams).appId (($cfg.gateway).teams).appSecret }}
 {{- $hasTelegram := (($cfg.gateway).telegram).botToken }}
 {{- $hasLine := (($cfg.gateway).line).channelSecret }}
@@ -46,10 +45,6 @@ spec:
               containerPort: 8080
               protocol: TCP
           env:
-            {{- if $pvcEnabled }}
-            - name: HOME
-              value: {{ $cfg.workingDir | default "/home/agent" | quote }}
-            {{- end }}
             {{- if ($cfg.gateway).token }}
             - name: GATEWAY_WS_TOKEN
               valueFrom:
@@ -241,14 +236,8 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          volumeMounts:
-            {{- if $pvcEnabled }}
-            - name: data
-              mountPath: {{ $cfg.workingDir | default "/home/agent" }}
-            {{- end }}
-            - name: tmp
-              mountPath: /tmp
           {{- with ($cfg.gateway).extraVolumeMounts }}
+          volumeMounts:
             {{- toYaml . | nindent 12 }}
           {{- end }}
       {{- with ($cfg.gateway).extraContainers }}
@@ -266,15 +255,8 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      volumes:
-        {{- if $pvcEnabled }}
-        - name: data
-          persistentVolumeClaim:
-            claimName: {{ (and $cfg.persistence $cfg.persistence.existingClaim) | default (include "openab.agentFullname" $agentD) }}
-        {{- end }}
-        - name: tmp
-          emptyDir: {}
       {{- with ($cfg.gateway).extraVolumes }}
+      volumes:
         {{- toYaml . | nindent 8 }}
       {{- end }}
 ---
