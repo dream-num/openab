@@ -1,6 +1,6 @@
 # Running Python Scripts in OpenAB
 
-OpenAB Docker images do **not** ship a system Python or `uv`. This keeps images small and avoids version conflicts. The recommended way to run Python scripts is with [`uv`](https://docs.astral.sh/uv/).
+OpenAB Docker images do **not** ship a system Python or `uv`. This is by design — images are kept minimal for simplicity, and users are free to install anything they need into `$HOME`, which is fully persisted across restarts. The recommended way to run Python scripts is with [`uv`](https://docs.astral.sh/uv/).
 
 ## Installing `uv`
 
