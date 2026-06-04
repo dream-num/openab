@@ -69,6 +69,9 @@ Before running openab, enable these in the [Discord Developer Portal](https://di
 
 See [docs/discord.md](docs/discord.md) for a detailed step-by-step guide.
 
+Discord outbound connections also respect standard process proxy variables:
+`http_proxy`, `https_proxy`, and `no_proxy` (uppercase variants supported).
+
 ### 1. Create a Bot
 
 <details>

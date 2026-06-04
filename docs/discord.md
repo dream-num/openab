@@ -63,6 +63,10 @@ Complete guide to setting up, configuring, and running OpenAB with Discord.
 
 > 📖 Full config options with defaults: [docs/config-reference.md](config-reference.md#discord)
 
+OpenAB's Discord adapter respects the process-level proxy environment for outbound Discord traffic:
+`http_proxy`, `https_proxy`, `no_proxy` (and uppercase variants). For Gateway WebSocket proxying,
+`http://` forward proxies are supported.
+
 ```toml
 [discord]
 bot_token = "${DISCORD_BOT_TOKEN}"

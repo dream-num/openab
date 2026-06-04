@@ -35,3 +35,6 @@ tempfile = "3.27.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[patch.crates-io]
+serenity = { path = "vendor/serenity-0.12.5" }

@@ -15,7 +15,9 @@ use serenity::builder::{
 };
 use serenity::http::Http;
 use serenity::model::application::ButtonStyle;
-use serenity::model::application::{Command, CommandOptionType, ComponentInteractionDataKind, Interaction};
+use serenity::model::application::{
+    Command, CommandOptionType, ComponentInteractionDataKind, Interaction,
+};
 use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, ReactionType};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
@@ -910,21 +912,30 @@ impl EventHandler for Handler {
             CreateCommand::new("reset").description("Reset the conversation session"),
             CreateCommand::new("remind")
                 .description("Set a one-shot reminder to mention users/roles after a delay")
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "targets",
-                    "Users/roles to mention (e.g. @user1 @role1)",
-                ).required(true))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "message",
-                    "Reminder message",
-                ).required(true))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "delay",
-                    "Delay before firing (e.g. 30m, 2h, 1d)",
-                ).required(true)),
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "targets",
+                        "Users/roles to mention (e.g. @user1 @role1)",
+                    )
+                    .required(true),
+                )
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "message",
+                        "Reminder message",
+                    )
+                    .required(true),
+                )
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "delay",
+                        "Delay before firing (e.g. 30m, 2h, 1d)",
+                    )
+                    .required(true),
+                ),
             CreateCommand::new("export-thread")
                 .description("Download this thread as a text file")
                 .add_option(CreateCommandOption::new(
@@ -1293,15 +1304,18 @@ impl Handler {
 
         // Extract options
         let opts = &cmd.data.options;
-        let targets_raw = opts.iter()
+        let targets_raw = opts
+            .iter()
             .find(|o| o.name == "targets")
             .and_then(|o| o.value.as_str())
             .unwrap_or("");
-        let message = opts.iter()
+        let message = opts
+            .iter()
             .find(|o| o.name == "message")
             .and_then(|o| o.value.as_str())
             .unwrap_or("");
-        let delay_raw = opts.iter()
+        let delay_raw = opts
+            .iter()
             .find(|o| o.name == "delay")
             .and_then(|o| o.value.as_str())
             .unwrap_or("");
@@ -1363,7 +1377,10 @@ impl Handler {
         if targets.len() > remind::MAX_TARGETS {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content(format!("⚠️ Too many targets (max {}). Use a @role instead.", remind::MAX_TARGETS))
+                    .content(format!(
+                        "⚠️ Too many targets (max {}). Use a @role instead.",
+                        remind::MAX_TARGETS
+                    ))
                     .ephemeral(true),
             );
             let _ = cmd.create_response(&ctx.http, response).await;
@@ -1452,9 +1469,7 @@ impl Handler {
                 );
                 (in_thread, gc.name.clone())
             }
-            Ok(serenity::model::channel::Channel::Private(_)) => {
-                (self.allow_dm, "dm".to_string())
-            }
+            Ok(serenity::model::channel::Channel::Private(_)) => (self.allow_dm, "dm".to_string()),
             Ok(_) => (false, "channel".to_string()),
             Err(e) => {
                 tracing::warn!(channel_id = %channel_id, error = %e, "failed to inspect channel for export");
@@ -1476,16 +1491,34 @@ impl Handler {
 
         // --- Parse and validate filter params (mutual exclusion) ---
         let opts = &cmd.data.options;
-        let limit_opt = opts.iter().find(|o| o.name == "limit").and_then(|o| o.value.as_i64());
-        let since_opt = opts.iter().find(|o| o.name == "since").and_then(|o| o.value.as_str());
-        let days_opt = opts.iter().find(|o| o.name == "days").and_then(|o| o.value.as_i64());
-        let all_opt = opts.iter().find(|o| o.name == "all").and_then(|o| o.value.as_bool()).unwrap_or(false);
+        let limit_opt = opts
+            .iter()
+            .find(|o| o.name == "limit")
+            .and_then(|o| o.value.as_i64());
+        let since_opt = opts
+            .iter()
+            .find(|o| o.name == "since")
+            .and_then(|o| o.value.as_str());
+        let days_opt = opts
+            .iter()
+            .find(|o| o.name == "days")
+            .and_then(|o| o.value.as_i64());
+        let all_opt = opts
+            .iter()
+            .find(|o| o.name == "all")
+            .and_then(|o| o.value.as_bool())
+            .unwrap_or(false);
 
-        let filter_count = limit_opt.is_some() as u8 + since_opt.is_some() as u8 + days_opt.is_some() as u8 + all_opt as u8;
+        let filter_count = limit_opt.is_some() as u8
+            + since_opt.is_some() as u8
+            + days_opt.is_some() as u8
+            + all_opt as u8;
         if filter_count > 1 {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content("⚠️ Please specify only one filter: `limit`, `since`, `days`, or `all`.")
+                    .content(
+                        "⚠️ Please specify only one filter: `limit`, `since`, `days`, or `all`.",
+                    )
                     .ephemeral(true),
             );
             let _ = cmd.create_response(&ctx.http, response).await;
@@ -1855,7 +1888,10 @@ async fn export_channel_messages(
 
     let filename = export_filename(channel_id, channel_name);
     if attachment_size_limit < 2048 {
-        tracing::warn!(attachment_size_limit, "attachment_size_limit is very small; export will likely be truncated");
+        tracing::warn!(
+            attachment_size_limit,
+            "attachment_size_limit is very small; export will likely be truncated"
+        );
     }
     let max_bytes = usize::try_from(attachment_size_limit)
         .unwrap_or(8 * 1024 * 1024)
@@ -1925,10 +1961,7 @@ fn format_export_message(msg: &Message) -> String {
     let bot_marker = if msg.author.bot { " [bot]" } else { "" };
     let mut out = format!(
         "[{}] {}{} ({})\n",
-        msg.timestamp,
-        msg.author.name,
-        bot_marker,
-        msg.author.id
+        msg.timestamp, msg.author.name, bot_marker, msg.author.id
     );
 
     if msg.content.is_empty() {
@@ -2268,7 +2301,7 @@ fn turn_limit_warning_present(messages: &[(bool, &str)]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bot_turns::{TurnResult, HARD_BOT_TURN_LIMIT, BOT_TURN_LIMIT_WARNING_PREFIX};
+    use crate::bot_turns::{TurnResult, BOT_TURN_LIMIT_WARNING_PREFIX, HARD_BOT_TURN_LIMIT};
 
     // --- resolve_mentions tests ---
 
@@ -3020,9 +3053,8 @@ mod tests {
         trusted_bot_ids: &HashSet<u64>,
         author_id: u64,
     ) -> bool {
-        let trusted_mention = is_mentioned
-            && !trusted_bot_ids.is_empty()
-            && trusted_bot_ids.contains(&author_id);
+        let trusted_mention =
+            is_mentioned && !trusted_bot_ids.is_empty() && trusted_bot_ids.contains(&author_id);
 
         if !trusted_mention {
             match allow_bot_messages {
@@ -3055,7 +3087,12 @@ mod tests {
     #[test]
     fn bot_admission_untrusted_mention_blocked_by_off() {
         let trusted = HashSet::from([42]);
-        assert!(!should_admit_bot_message(AllowBots::Off, true, &trusted, 99));
+        assert!(!should_admit_bot_message(
+            AllowBots::Off,
+            true,
+            &trusted,
+            99
+        ));
     }
 
     /// GIVEN: allow_bot_messages=Off, trusted bot without @mention
@@ -3063,7 +3100,12 @@ mod tests {
     #[test]
     fn bot_admission_trusted_no_mention_blocked_by_off() {
         let trusted = HashSet::from([42]);
-        assert!(!should_admit_bot_message(AllowBots::Off, false, &trusted, 42));
+        assert!(!should_admit_bot_message(
+            AllowBots::Off,
+            false,
+            &trusted,
+            42
+        ));
     }
 
     /// GIVEN: allow_bot_messages=Off, empty trusted_bot_ids, bot @mentions
@@ -3071,7 +3113,12 @@ mod tests {
     #[test]
     fn bot_admission_empty_trusted_ids_off_mode() {
         let trusted: HashSet<u64> = HashSet::new();
-        assert!(!should_admit_bot_message(AllowBots::Off, true, &trusted, 42));
+        assert!(!should_admit_bot_message(
+            AllowBots::Off,
+            true,
+            &trusted,
+            42
+        ));
     }
 
     /// GIVEN: allow_bot_messages=Mentions, trusted bot @mentions
@@ -3079,7 +3126,12 @@ mod tests {
     #[test]
     fn bot_admission_mentions_mode_trusted_mention() {
         let trusted = HashSet::from([42]);
-        assert!(should_admit_bot_message(AllowBots::Mentions, true, &trusted, 42));
+        assert!(should_admit_bot_message(
+            AllowBots::Mentions,
+            true,
+            &trusted,
+            42
+        ));
     }
 
     /// GIVEN: allow_bot_messages=All, untrusted bot (not in trusted_bot_ids)
@@ -3087,7 +3139,12 @@ mod tests {
     #[test]
     fn bot_admission_all_mode_untrusted_bot_rejected() {
         let trusted = HashSet::from([42]);
-        assert!(!should_admit_bot_message(AllowBots::All, false, &trusted, 99));
+        assert!(!should_admit_bot_message(
+            AllowBots::All,
+            false,
+            &trusted,
+            99
+        ));
     }
 
     // --- DM gating tests (#656) ---
@@ -3177,19 +3234,28 @@ mod tests {
 
     #[test]
     fn dedup_detects_existing_bot_warning() {
-        let msg = format!("{} (20/20). A human must reply.", BOT_TURN_LIMIT_WARNING_PREFIX);
+        let msg = format!(
+            "{} (20/20). A human must reply.",
+            BOT_TURN_LIMIT_WARNING_PREFIX
+        );
         assert!(turn_limit_warning_present(&[(true, &msg)]));
     }
 
     #[test]
     fn dedup_ignores_human_warning_text() {
-        let msg = format!("{} (20/20). A human must reply.", BOT_TURN_LIMIT_WARNING_PREFIX);
+        let msg = format!(
+            "{} (20/20). A human must reply.",
+            BOT_TURN_LIMIT_WARNING_PREFIX
+        );
         assert!(!turn_limit_warning_present(&[(false, &msg)]));
     }
 
     #[test]
     fn dedup_returns_false_when_no_warning() {
-        assert!(!turn_limit_warning_present(&[(true, "hello"), (false, "world")]));
+        assert!(!turn_limit_warning_present(&[
+            (true, "hello"),
+            (false, "world")
+        ]));
     }
 
     #[test]
