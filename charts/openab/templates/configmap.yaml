@@ -255,6 +255,9 @@ data:
     {{- if and $pb.onFailure (not (has $pb.onFailure (list "abort" "warn"))) }}
     {{- fail (printf "agents.%s.hooks.preBoot.onFailure must be one of: abort, warn — got: %s" $name $pb.onFailure) }}
     {{- end }}
+    {{- if and $pb.url (not $pb.sha256) }}
+    {{- fail (printf "agents.%s.hooks.preBoot.sha256 is required when url is set" $name) }}
+    {{- end }}
     {{- if and (hasKey $pb "timeoutSeconds") (lt (int $pb.timeoutSeconds) 1) }}
     {{- fail (printf "agents.%s.hooks.preBoot.timeoutSeconds must be a positive integer — got: %v" $name $pb.timeoutSeconds) }}
     {{- end }}
@@ -283,6 +286,9 @@ data:
     {{- end }}
     {{- if and $ps.onFailure (not (has $ps.onFailure (list "abort" "warn"))) }}
     {{- fail (printf "agents.%s.hooks.preShutdown.onFailure must be one of: abort, warn — got: %s" $name $ps.onFailure) }}
+    {{- end }}
+    {{- if and $ps.url (not $ps.sha256) }}
+    {{- fail (printf "agents.%s.hooks.preShutdown.sha256 is required when url is set" $name) }}
     {{- end }}
     {{- if and (hasKey $ps "timeoutSeconds") (lt (int $ps.timeoutSeconds) 1) }}
     {{- fail (printf "agents.%s.hooks.preShutdown.timeoutSeconds must be a positive integer — got: %v" $name $ps.timeoutSeconds) }}

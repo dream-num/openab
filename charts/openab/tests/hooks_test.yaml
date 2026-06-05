@@ -123,3 +123,10 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "timeoutSeconds must be a positive integer"
+
+  - it: rejects url without sha256
+    set:
+      agents.kiro.hooks.preBoot.url: "https://example.com/boot.sh"
+    asserts:
+      - failedTemplate:
+          errorPattern: "sha256 is required when url is set"
