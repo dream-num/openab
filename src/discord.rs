@@ -11,15 +11,17 @@ use crate::remind::{self, ReminderStore};
 use async_trait::async_trait;
 use serenity::builder::{
     CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateCommandOption,
-    CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
-    CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditMessage,
-    GetMessages,
+    CreateInputText, CreateInteractionResponse, CreateInteractionResponseFollowup,
+    CreateInteractionResponseMessage, CreateModal, CreateSelectMenu, CreateSelectMenuKind,
+    CreateSelectMenuOption, CreateThread, EditInteractionResponse, EditMessage, GetMessages,
 };
 use serenity::http::Http;
 use serenity::http::Typing;
 use serenity::model::application::ButtonStyle;
+use serenity::model::application::{ActionRowComponent, InputTextStyle};
 use serenity::model::application::{
-    Command, CommandOptionType, ComponentInteractionDataKind, Interaction,
+    Command, CommandOptionType, CommandType, ComponentInteractionDataKind, Interaction,
+    ResolvedTarget,
 };
 use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, ReactionType};
 use serenity::model::gateway::Ready;
@@ -42,6 +44,10 @@ const SELECT_MENU_PAGE_SIZE: usize = 25;
 
 /// Avoid unbounded Discord history exports from very large threads.
 const THREAD_EXPORT_MESSAGE_LIMIT: usize = 5000;
+const CONTEXT_HISTORY_PROMPT_BYTES: usize = 12_000;
+const READ_CONTEXT_COMMAND_NAME: &str = "Read Context";
+const HISTORY_BUTTON_PREFIX: &str = "ctxhist:";
+const HISTORY_MODAL_PREFIX: &str = "ctxmodal:";
 
 // --- DiscordAdapter: implements ChatAdapter for Discord via serenity ---
 
@@ -66,6 +72,44 @@ struct DiscordTypingHandle(Typing);
 impl TypingHandle for DiscordTypingHandle {
     fn stop(self: Box<Self>) {
         let _ = self.0.stop();
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HistorySelectionMode {
+    Before10,
+    Before20,
+    ToNow,
+    Recent100,
+}
+
+impl HistorySelectionMode {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Before10 => "b10",
+            Self::Before20 => "b20",
+            Self::ToNow => "tonow",
+            Self::Recent100 => "r100",
+        }
+    }
+
+    fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "b10" => Some(Self::Before10),
+            "b20" => Some(Self::Before20),
+            "tonow" => Some(Self::ToNow),
+            "r100" => Some(Self::Recent100),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Before10 => "前 10 条",
+            Self::Before20 => "前 20 条",
+            Self::ToNow => "从这条到现在",
+            Self::Recent100 => "最近 100 条",
+        }
     }
 }
 
@@ -871,50 +915,16 @@ impl EventHandler for Handler {
             cache.contains_key(&msg.channel_id.to_string())
         };
 
-        // Backfill thread_id: when OAB just created a new thread, the sender
-        // was built before the thread existed. Patch it so the agent sees
-        // thread_id on the very first turn.
-        let mut sender = sender;
-        if sender.thread_id.is_none() && thread_channel.parent_id.is_some() {
-            sender.thread_id = Some(thread_channel.channel_id.clone());
-        }
-
-        let dispatcher = self.dispatcher.clone();
-        let stt_cfg = self.stt_config.clone();
-
-        tokio::spawn(async move {
-            // Best-effort echo before the agent reply so the user can verify STT.
-            crate::stt::post_echo(
-                &adapter,
-                &thread_channel,
-                &trigger_msg,
-                &echo_entries,
-                &stt_cfg,
-            )
-            .await;
-
-            let sender_id = sender.sender_id.clone();
-            let sender_name = sender.sender_name.clone();
-            let sender_json = serde_json::to_string(&sender).unwrap();
-            let thread_key = dispatcher.key("discord", &thread_channel.channel_id, &sender_id);
-            let estimated_tokens = crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
-            let buf_msg = crate::dispatch::BufferedMessage {
-                sender_json,
-                sender_name,
-                prompt,
-                extra_blocks,
-                trigger_msg,
-                arrived_at: std::time::Instant::now(),
-                estimated_tokens,
-                other_bot_present: other_bot_present_flag,
-            };
-            if let Err(e) = dispatcher
-                .submit(thread_key, thread_channel, adapter, buf_msg)
-                .await
-            {
-                error!("dispatcher submit error: {e}");
-            }
-        });
+        self.spawn_agent_turn(
+            adapter,
+            thread_channel,
+            trigger_msg,
+            sender,
+            prompt,
+            extra_blocks,
+            other_bot_present_flag,
+            echo_entries,
+        );
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {
@@ -976,6 +986,7 @@ impl EventHandler for Handler {
                     "all",
                     "Export all messages (up to 5000). Default is last 100.",
                 )),
+            CreateCommand::new(READ_CONTEXT_COMMAND_NAME).kind(CommandType::Message),
         ];
 
         // Register global commands only. Registering the same commands per-guild
@@ -1042,11 +1053,22 @@ impl EventHandler for Handler {
             Interaction::Command(cmd) if cmd.data.name == "export-thread" => {
                 self.handle_export_thread_command(&ctx, &cmd).await;
             }
+            Interaction::Command(cmd) if cmd.data.name == READ_CONTEXT_COMMAND_NAME => {
+                self.handle_read_context_command(&ctx, &cmd).await;
+            }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_config_") => {
                 self.handle_config_select(&ctx, &comp).await;
             }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_pg:") => {
                 self.handle_pagination(&ctx, &comp).await;
+            }
+            Interaction::Component(comp)
+                if comp.data.custom_id.starts_with(HISTORY_BUTTON_PREFIX) =>
+            {
+                self.handle_history_button(&ctx, &comp).await;
+            }
+            Interaction::Modal(modal) if modal.data.custom_id.starts_with(HISTORY_MODAL_PREFIX) => {
+                self.handle_history_modal(&ctx, &modal).await;
             }
             _ => {}
         }
@@ -1642,6 +1664,443 @@ impl Handler {
         }
     }
 
+    async fn handle_read_context_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        if is_denied_user(
+            false,
+            self.allow_all_users,
+            &self.allowed_users,
+            cmd.user.id.get(),
+        ) {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 You are not allowed to use this bot.")
+                    .ephemeral(true),
+            );
+            let _ = cmd.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        let Some(ResolvedTarget::Message(target)) = cmd.data.target() else {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ Please run this command from a message context menu.")
+                    .ephemeral(true),
+            );
+            let _ = cmd.create_response(&ctx.http, response).await;
+            return;
+        };
+        let target = target.clone();
+
+        let response = CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content("选择要读取的历史范围：")
+                .components(Self::build_history_buttons(target.id))
+                .ephemeral(true),
+        );
+        if let Err(e) = cmd.create_response(&ctx.http, response).await {
+            tracing::error!(error = %e, "failed to respond to Read Context command");
+        }
+    }
+
+    fn build_history_buttons(target_message_id: MessageId) -> Vec<CreateActionRow> {
+        let row1 = CreateActionRow::Buttons(vec![
+            CreateButton::new(format!(
+                "{HISTORY_BUTTON_PREFIX}{}:{}",
+                HistorySelectionMode::Before10.code(),
+                target_message_id
+            ))
+            .label(HistorySelectionMode::Before10.label())
+            .style(ButtonStyle::Primary),
+            CreateButton::new(format!(
+                "{HISTORY_BUTTON_PREFIX}{}:{}",
+                HistorySelectionMode::Before20.code(),
+                target_message_id
+            ))
+            .label(HistorySelectionMode::Before20.label())
+            .style(ButtonStyle::Primary),
+        ]);
+        let row2 = CreateActionRow::Buttons(vec![
+            CreateButton::new(format!(
+                "{HISTORY_BUTTON_PREFIX}{}:{}",
+                HistorySelectionMode::ToNow.code(),
+                target_message_id
+            ))
+            .label(HistorySelectionMode::ToNow.label())
+            .style(ButtonStyle::Secondary),
+            CreateButton::new(format!(
+                "{HISTORY_BUTTON_PREFIX}{}:{}",
+                HistorySelectionMode::Recent100.code(),
+                target_message_id
+            ))
+            .label(HistorySelectionMode::Recent100.label())
+            .style(ButtonStyle::Secondary),
+        ]);
+        vec![row1, row2]
+    }
+
+    async fn handle_history_button(
+        &self,
+        ctx: &Context,
+        comp: &serenity::model::application::ComponentInteraction,
+    ) {
+        let Some((mode, target_id)) = Self::parse_history_button_custom_id(&comp.data.custom_id)
+        else {
+            return;
+        };
+        let modal = CreateModal::new(
+            format!("{HISTORY_MODAL_PREFIX}{}:{}", mode.code(), target_id),
+            format!("读取历史: {}", mode.label()),
+        )
+        .components(vec![CreateActionRow::InputText(
+            CreateInputText::new(InputTextStyle::Paragraph, "补充说明", "prompt")
+                .placeholder("例如：总结这段讨论并给出行动项；或解释这条消息的上下文")
+                .required(false)
+                .max_length(1000),
+        )]);
+        if let Err(e) = comp
+            .create_response(&ctx.http, CreateInteractionResponse::Modal(modal))
+            .await
+        {
+            tracing::warn!(error = %e, "failed to open history modal");
+        }
+    }
+
+    async fn handle_history_modal(
+        &self,
+        ctx: &Context,
+        modal: &serenity::model::application::ModalInteraction,
+    ) {
+        let Some((mode, target_id)) = Self::parse_history_modal_custom_id(&modal.data.custom_id)
+        else {
+            return;
+        };
+
+        if let Err(e) = modal.defer_ephemeral(&ctx.http).await {
+            tracing::warn!(error = %e, "failed to defer history modal interaction");
+            return;
+        }
+        let user_prompt = Self::modal_input_value(&modal.data.components, "prompt")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+
+        let adapter = self
+            .adapter
+            .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
+            .clone();
+        let bot_id = ctx.cache.current_user().id;
+        let bot_id_str = bot_id.to_string();
+
+        let target_msg = match modal.channel_id.message(&ctx.http, target_id).await {
+            Ok(msg) => msg,
+            Err(e) => {
+                let _ = modal
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new()
+                            .content(format!("⚠️ Failed to fetch target message: {e}")),
+                    )
+                    .await;
+                return;
+            }
+        };
+
+        let Some((in_thread, thread_parent_id, is_dm)) = self
+            .inspect_context_channel(&ctx.http, target_msg.channel_id, bot_id)
+            .await
+        else {
+            let _ = modal
+                .edit_response(
+                    &ctx.http,
+                    EditInteractionResponse::new().content("⚠️ This channel is not allowed."),
+                )
+                .await;
+            return;
+        };
+
+        let history = match self
+            .collect_history_messages(&ctx.http, target_msg.channel_id, target_id, mode)
+            .await
+        {
+            Ok(messages) if !messages.is_empty() => messages,
+            Ok(_) => {
+                let _ = modal
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new().content("⚠️ No history messages found."),
+                    )
+                    .await;
+                return;
+            }
+            Err(e) => {
+                let _ = modal
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new()
+                            .content(format!("⚠️ Failed to read message history: {e}")),
+                    )
+                    .await;
+                return;
+            }
+        };
+
+        let target_summary = format_export_message(&target_msg);
+        let history_block = render_history_block(target_msg.channel_id, &history, mode);
+        let prompt = build_history_prompt(&target_msg, &target_summary, mode, &user_prompt);
+        let thread_channel = if in_thread || is_dm {
+            ChannelRef {
+                platform: "discord".into(),
+                channel_id: target_msg.channel_id.get().to_string(),
+                thread_id: None,
+                parent_id: thread_parent_id.clone(),
+                origin_event_id: None,
+            }
+        } else {
+            let thread_seed = if target_msg.content.trim().is_empty() {
+                "read context".to_string()
+            } else {
+                target_msg.content.clone()
+            };
+            match get_or_create_thread(ctx, &adapter, &target_msg, &thread_seed).await {
+                Ok(ch) => ch,
+                Err(e) => {
+                    let _ = modal
+                        .edit_response(
+                            &ctx.http,
+                            EditInteractionResponse::new()
+                                .content(format!("⚠️ Failed to create thread: {e}")),
+                        )
+                        .await;
+                    return;
+                }
+            }
+        };
+
+        let display_name = modal
+            .member
+            .as_ref()
+            .and_then(|m| m.nick.as_ref())
+            .or(modal.user.global_name.as_ref())
+            .unwrap_or(&modal.user.name);
+        let sender = build_sender_context(
+            &modal.user.id.to_string(),
+            &modal.user.name,
+            display_name,
+            &thread_channel.channel_id,
+            thread_channel.parent_id.as_deref(),
+            false,
+            &chrono::Utc::now().to_rfc3339(),
+            &target_id.to_string(),
+            &bot_id_str,
+        );
+        let trigger_msg = discord_msg_ref(&target_msg);
+        let other_bot_present = {
+            let cache = self.multibot_threads.lock().await;
+            cache.contains_key(&thread_channel.channel_id)
+        };
+
+        self.spawn_agent_turn(
+            adapter,
+            thread_channel.clone(),
+            trigger_msg,
+            sender,
+            prompt,
+            vec![ContentBlock::Text {
+                text: history_block,
+            }],
+            other_bot_present,
+            Vec::new(),
+        );
+
+        let channel_hint = if is_dm {
+            "this DM".to_string()
+        } else if thread_channel.parent_id.is_some() || in_thread {
+            format!("<#{}>", thread_channel.channel_id)
+        } else {
+            "this thread".to_string()
+        };
+        let _ = modal
+            .edit_response(
+                &ctx.http,
+                EditInteractionResponse::new().content(format!(
+                    "已读取 `{}` 历史，正在 {} 中加载上下文。",
+                    mode.label(),
+                    channel_hint
+                )),
+            )
+            .await;
+    }
+
+    fn parse_history_button_custom_id(
+        custom_id: &str,
+    ) -> Option<(HistorySelectionMode, MessageId)> {
+        let rest = custom_id.strip_prefix(HISTORY_BUTTON_PREFIX)?;
+        let (mode, msg_id) = rest.split_once(':')?;
+        let mode = HistorySelectionMode::from_code(mode)?;
+        let message_id = msg_id.parse::<u64>().ok().map(MessageId::new)?;
+        Some((mode, message_id))
+    }
+
+    fn parse_history_modal_custom_id(custom_id: &str) -> Option<(HistorySelectionMode, MessageId)> {
+        let rest = custom_id.strip_prefix(HISTORY_MODAL_PREFIX)?;
+        let (mode, msg_id) = rest.split_once(':')?;
+        let mode = HistorySelectionMode::from_code(mode)?;
+        let message_id = msg_id.parse::<u64>().ok().map(MessageId::new)?;
+        Some((mode, message_id))
+    }
+
+    fn modal_input_value(
+        components: &[serenity::model::application::ActionRow],
+        input_id: &str,
+    ) -> Option<String> {
+        components.iter().find_map(|row| {
+            row.components.iter().find_map(|component| match component {
+                ActionRowComponent::InputText(text) if text.custom_id == input_id => {
+                    text.value.clone()
+                }
+                _ => None,
+            })
+        })
+    }
+
+    async fn inspect_context_channel(
+        &self,
+        http: &Http,
+        channel_id: ChannelId,
+        bot_id: UserId,
+    ) -> Option<(bool, Option<String>, bool)> {
+        let in_allowed_channel =
+            self.allow_all_channels || self.allowed_channels.contains(&channel_id.get());
+        match channel_id.to_channel(http).await.ok()? {
+            serenity::model::channel::Channel::Guild(gc) => {
+                let (in_thread, _) = detect_thread(
+                    gc.thread_metadata.is_some(),
+                    gc.parent_id.map(|id| id.get()),
+                    gc.owner_id.map(|id| id.get()),
+                    bot_id.get(),
+                    &self.allowed_channels,
+                    self.allow_all_channels,
+                    in_allowed_channel,
+                );
+                if !in_allowed_channel && !in_thread {
+                    return None;
+                }
+                Some((
+                    in_thread,
+                    if in_thread {
+                        gc.parent_id.map(|id| id.get().to_string())
+                    } else {
+                        None
+                    },
+                    false,
+                ))
+            }
+            serenity::model::channel::Channel::Private(_) => {
+                if self.allow_dm {
+                    Some((false, None, true))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    async fn collect_history_messages(
+        &self,
+        http: &Http,
+        channel_id: ChannelId,
+        target_id: MessageId,
+        mode: HistorySelectionMode,
+    ) -> anyhow::Result<Vec<Message>> {
+        let mut messages = match mode {
+            HistorySelectionMode::Before10 => {
+                let mut msgs = channel_id
+                    .messages(http, GetMessages::new().before(target_id).limit(10))
+                    .await?;
+                msgs.push(channel_id.message(http, target_id).await?);
+                msgs
+            }
+            HistorySelectionMode::Before20 => {
+                let mut msgs = channel_id
+                    .messages(http, GetMessages::new().before(target_id).limit(20))
+                    .await?;
+                msgs.push(channel_id.message(http, target_id).await?);
+                msgs
+            }
+            HistorySelectionMode::ToNow => {
+                let mut msgs = channel_id
+                    .messages(http, GetMessages::new().after(target_id).limit(99))
+                    .await?;
+                msgs.push(channel_id.message(http, target_id).await?);
+                msgs
+            }
+            HistorySelectionMode::Recent100 => {
+                channel_id
+                    .messages(http, GetMessages::new().limit(100))
+                    .await?
+            }
+        };
+        messages.sort_unstable_by_key(|m| m.id);
+        Ok(messages)
+    }
+
+    fn spawn_agent_turn(
+        &self,
+        adapter: Arc<dyn ChatAdapter>,
+        thread_channel: ChannelRef,
+        trigger_msg: MessageRef,
+        mut sender: SenderContext,
+        prompt: String,
+        extra_blocks: Vec<ContentBlock>,
+        other_bot_present_flag: bool,
+        echo_entries: Vec<crate::stt::EchoEntry>,
+    ) {
+        if sender.thread_id.is_none() && thread_channel.parent_id.is_some() {
+            sender.thread_id = Some(thread_channel.channel_id.clone());
+        }
+
+        let dispatcher = self.dispatcher.clone();
+        let stt_cfg = self.stt_config.clone();
+
+        tokio::spawn(async move {
+            crate::stt::post_echo(
+                &adapter,
+                &thread_channel,
+                &trigger_msg,
+                &echo_entries,
+                &stt_cfg,
+            )
+            .await;
+
+            let sender_id = sender.sender_id.clone();
+            let sender_name = sender.sender_name.clone();
+            let sender_json = serde_json::to_string(&sender).unwrap();
+            let thread_key = dispatcher.key("discord", &thread_channel.channel_id, &sender_id);
+            let estimated_tokens = crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
+            let buf_msg = crate::dispatch::BufferedMessage {
+                sender_json,
+                sender_name,
+                prompt,
+                extra_blocks,
+                trigger_msg,
+                arrived_at: std::time::Instant::now(),
+                estimated_tokens,
+                other_bot_present: other_bot_present_flag,
+            };
+            if let Err(e) = dispatcher
+                .submit(thread_key, thread_channel, adapter, buf_msg)
+                .await
+            {
+                error!("dispatcher submit error: {e}");
+            }
+        });
+    }
+
     async fn handle_config_select(
         &self,
         ctx: &Context,
@@ -1999,6 +2458,57 @@ fn format_export_message(msg: &Message) -> String {
 
     out.push('\n');
     out
+}
+
+fn render_history_block(
+    channel_id: ChannelId,
+    messages: &[Message],
+    mode: HistorySelectionMode,
+) -> String {
+    let header = format!(
+        "<discord_history>\nSource channel: {channel_id}\nSelection: {}\nMessages: {}\n\n",
+        mode.label(),
+        messages.len()
+    );
+    let entries: Vec<String> = messages.iter().map(format_export_message).collect();
+    let (body, _, truncated) = assemble_export(&header, &entries, CONTEXT_HISTORY_PROMPT_BYTES);
+    if truncated {
+        format!("{body}\n[History truncated to fit prompt budget]\n</discord_history>")
+    } else {
+        format!("{body}</discord_history>")
+    }
+}
+
+fn build_history_prompt(
+    target: &Message,
+    target_summary: &str,
+    mode: HistorySelectionMode,
+    user_prompt: &str,
+) -> String {
+    let target_text = if target.content.trim().is_empty() {
+        "(no text on selected message)".to_string()
+    } else {
+        target.content.trim().to_string()
+    };
+    let user_prompt = if user_prompt.trim().is_empty() {
+        "No extra instruction provided.".to_string()
+    } else {
+        user_prompt.trim().to_string()
+    };
+    format!(
+        "A user selected a Discord message and asked you to read surrounding history.\n\
+Selection mode: {}.\n\
+Treat the <discord_history> block as authoritative background context.\n\
+User instruction:\n{}\n\n\
+Selected message text:\n{}\n\n\
+Selected message detail:\n{}\n\
+If the selected message already contains a clear request, answer it directly using the history.\n\
+Otherwise, briefly acknowledge that the context is loaded and ask one concise follow-up question.",
+        mode.label(),
+        user_prompt,
+        target_text,
+        target_summary.trim_end()
+    )
 }
 
 fn export_filename(channel_id: ChannelId, channel_name: &str) -> String {
@@ -3279,5 +3789,24 @@ mod tests {
     #[test]
     fn dedup_returns_false_for_empty_messages() {
         assert!(!turn_limit_warning_present(&[]));
+    }
+
+    #[test]
+    fn parse_history_button_custom_id_round_trip() {
+        let custom_id = format!(
+            "{HISTORY_BUTTON_PREFIX}{}:{}",
+            HistorySelectionMode::Before20.code(),
+            123456789012345678u64
+        );
+        let parsed = Handler::parse_history_button_custom_id(&custom_id)
+            .expect("history button id should parse");
+        assert!(matches!(parsed.0, HistorySelectionMode::Before20));
+        assert_eq!(parsed.1, MessageId::new(123456789012345678));
+    }
+
+    #[test]
+    fn parse_history_button_custom_id_rejects_invalid_shape() {
+        assert!(Handler::parse_history_button_custom_id("ctxhist:bogus").is_none());
+        assert!(Handler::parse_history_button_custom_id("bogus:b10:123").is_none());
     }
 }
