@@ -11,6 +11,24 @@ use crate::format;
 use crate::markdown::{self, TableMode};
 use crate::reactions::StatusReactionController;
 
+pub trait TypingHandle: Send {
+    fn stop(self: Box<Self>);
+}
+
+#[derive(Debug, Clone)]
+enum ProgressPhase {
+    Thinking,
+    Tool(String),
+}
+
+#[derive(Debug)]
+struct ProgressState {
+    phase: ProgressPhase,
+    started_at: std::time::Instant,
+    last_update_at: std::time::Instant,
+    visible_output_started: bool,
+}
+
 // --- Output directive parsing ---
 
 /// Parsed directives from agent output header block.
@@ -265,6 +283,12 @@ pub trait ChatAdapter: Send + Sync + 'static {
     /// not be detected until the next message. This is acceptable: the first
     /// response may stream, but subsequent ones will correctly use send-once.
     fn use_streaming(&self, other_bot_present: bool) -> bool;
+
+    /// Start a platform-native typing indicator for a long-running turn.
+    /// Default: unsupported / no-op.
+    fn start_typing(&self, _channel: &ChannelRef) -> Option<Box<dyn TypingHandle>> {
+        None
+    }
 }
 
 // --- AdapterRouter ---
@@ -465,6 +489,7 @@ impl AdapterRouter {
         let thread_channel = thread_channel.clone();
         let message_limit = adapter.message_limit();
         let streaming = adapter.use_streaming(other_bot_present);
+        let typing = adapter.start_typing(&thread_channel);
         let table_mode = self.table_mode;
         let tool_display = self.reactions_config.tool_display;
         let prompt_hard_timeout = self.prompt_hard_timeout;
@@ -482,6 +507,12 @@ impl AdapterRouter {
 
                     let mut text_buf = String::new();
                     let mut tool_lines: Vec<ToolEntry> = Vec::new();
+                    let progress = std::sync::Arc::new(tokio::sync::Mutex::new(ProgressState {
+                        phase: ProgressPhase::Thinking,
+                        started_at: std::time::Instant::now(),
+                        last_update_at: std::time::Instant::now(),
+                        visible_output_started: false,
+                    }));
 
                     if reset {
                         text_buf.push_str("⚠️ _Session expired, starting fresh..._\n\n");
@@ -500,25 +531,37 @@ impl AdapterRouter {
                         let edit_msg = msg.clone();
                         let limit = message_limit;
                         let mut buf_rx = rx;
+                        let progress = progress.clone();
                         tokio::spawn(async move {
                             let mut last = String::new();
                             loop {
-                                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                                if buf_rx.has_changed().unwrap_or(false) {
+                                tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+                                let changed = buf_rx.has_changed().unwrap_or(false);
+                                let candidate = if changed {
                                     let content = buf_rx.borrow_and_update().clone();
-                                    if content != last {
-                                        let display = if content.chars().count() > limit - 100 {
-                                            format!(
-                                                "…{}",
-                                                format::truncate_chars_tail(&content, limit - 100)
-                                            )
-                                        } else {
-                                            content.clone()
-                                        };
-                                        let _ =
-                                            edit_adapter.edit_message(&edit_msg, &display).await;
-                                        last = content;
+                                    let mut state = progress.lock().await;
+                                    state.visible_output_started = true;
+                                    content
+                                } else {
+                                    let state = progress.lock().await;
+                                    if state.visible_output_started {
+                                        String::new()
+                                    } else {
+                                        progress_status_line(&state)
                                     }
+                                };
+
+                                if !candidate.is_empty() && candidate != last {
+                                    let display = if candidate.chars().count() > limit - 100 {
+                                        format!(
+                                            "…{}",
+                                            format::truncate_chars_tail(&candidate, limit - 100)
+                                        )
+                                    } else {
+                                        candidate.clone()
+                                    };
+                                    let _ = edit_adapter.edit_message(&edit_msg, &display).await;
+                                    last = candidate;
                                 }
                                 if buf_rx.has_changed().is_err() {
                                     break;
@@ -578,6 +621,7 @@ impl AdapterRouter {
                             match event {
                                 AcpEvent::Text(t) => {
                                     text_buf.push_str(&t);
+                                    touch_progress(&progress, None).await;
                                     if let Some(tx) = &buf_tx {
                                         let _ = tx.send(compose_display(
                                             &tool_lines,
@@ -589,10 +633,16 @@ impl AdapterRouter {
                                 }
                                 AcpEvent::Thinking => {
                                     reactions.set_thinking().await;
+                                    touch_progress(&progress, Some(ProgressPhase::Thinking)).await;
                                 }
                                 AcpEvent::ToolStart { id, title } if !title.is_empty() => {
                                     reactions.set_tool(&title).await;
                                     let title = sanitize_title(&title);
+                                    touch_progress(
+                                        &progress,
+                                        Some(ProgressPhase::Tool(title.clone())),
+                                    )
+                                    .await;
                                     if let Some(slot) = tool_lines.iter_mut().find(|e| e.id == id) {
                                         slot.title = title;
                                         slot.state = ToolState::Running;
@@ -614,6 +664,7 @@ impl AdapterRouter {
                                 }
                                 AcpEvent::ToolDone { id, title, status } => {
                                     reactions.set_thinking().await;
+                                    touch_progress(&progress, Some(ProgressPhase::Thinking)).await;
                                     let new_state = if status == "completed" {
                                         ToolState::Completed
                                     } else {
@@ -642,6 +693,7 @@ impl AdapterRouter {
                                 }
                                 AcpEvent::ConfigUpdate { options } => {
                                     conn.config_options = options;
+                                    touch_progress(&progress, None).await;
                                 }
                                 _ => {}
                             }
@@ -734,6 +786,10 @@ impl AdapterRouter {
                         }
                     }
 
+                    if let Some(typing) = typing {
+                        typing.stop();
+                    }
+
                     Ok(())
                 })
             })
@@ -747,6 +803,41 @@ fn sanitize_title(title: &str) -> String {
         .replace('\r', "")
         .replace('\n', " ; ")
         .replace('`', "'")
+}
+
+async fn touch_progress(
+    progress: &std::sync::Arc<tokio::sync::Mutex<ProgressState>>,
+    phase: Option<ProgressPhase>,
+) {
+    let mut state = progress.lock().await;
+    if let Some(phase) = phase {
+        state.phase = phase;
+    }
+    state.last_update_at = std::time::Instant::now();
+}
+
+fn progress_status_line(state: &ProgressState) -> String {
+    let elapsed = state.started_at.elapsed().as_secs();
+    let idle = state.last_update_at.elapsed().as_secs();
+
+    if idle >= 45 {
+        return format!("⚠️ Still working... {elapsed}s");
+    }
+    if idle >= 15 {
+        return format!("⏳ Waiting for agent output... {elapsed}s");
+    }
+
+    match &state.phase {
+        ProgressPhase::Thinking => format!("⏳ Thinking... {elapsed}s"),
+        ProgressPhase::Tool(title) => {
+            let title = if title.chars().count() > 60 {
+                format!("{}...", title.chars().take(57).collect::<String>())
+            } else {
+                title.clone()
+            };
+            format!("🔧 Running `{title}`... {elapsed}s")
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -878,6 +969,47 @@ fn compose_display(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    fn progress_state(phase: ProgressPhase, elapsed_secs: u64, idle_secs: u64) -> ProgressState {
+        let now = Instant::now();
+        ProgressState {
+            phase,
+            started_at: now - Duration::from_secs(elapsed_secs),
+            last_update_at: now - Duration::from_secs(idle_secs),
+            visible_output_started: false,
+        }
+    }
+
+    #[test]
+    fn progress_status_thinking() {
+        let state = progress_state(ProgressPhase::Thinking, 12, 3);
+        assert_eq!(progress_status_line(&state), "⏳ Thinking... 12s");
+    }
+
+    #[test]
+    fn progress_status_tool() {
+        let state = progress_state(ProgressPhase::Tool("exec_command".into()), 38, 4);
+        assert_eq!(
+            progress_status_line(&state),
+            "🔧 Running `exec_command`... 38s"
+        );
+    }
+
+    #[test]
+    fn progress_status_waiting() {
+        let state = progress_state(ProgressPhase::Thinking, 20, 18);
+        assert_eq!(
+            progress_status_line(&state),
+            "⏳ Waiting for agent output... 20s"
+        );
+    }
+
+    #[test]
+    fn progress_status_still_working() {
+        let state = progress_state(ProgressPhase::Thinking, 52, 46);
+        assert_eq!(progress_status_line(&state), "⚠️ Still working... 52s");
+    }
 
     /// Compile-time regression guard: use_streaming() is a required trait method
     /// (no default). Any adapter that forgets to implement it will fail to compile.

@@ -1,6 +1,8 @@
 use crate::acp::protocol::ConfigOption;
 use crate::acp::ContentBlock;
-use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
+use crate::adapter::{
+    AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext, TypingHandle,
+};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::format;
@@ -14,6 +16,7 @@ use serenity::builder::{
     GetMessages,
 };
 use serenity::http::Http;
+use serenity::http::Typing;
 use serenity::model::application::ButtonStyle;
 use serenity::model::application::{
     Command, CommandOptionType, ComponentInteractionDataKind, Interaction,
@@ -55,6 +58,14 @@ impl DiscordAdapter {
     /// Discord threads are channels, so prefer thread_id when set.
     fn resolve_channel(channel: &ChannelRef) -> &str {
         channel.thread_id.as_deref().unwrap_or(&channel.channel_id)
+    }
+}
+
+struct DiscordTypingHandle(Typing);
+
+impl TypingHandle for DiscordTypingHandle {
+    fn stop(self: Box<Self>) {
+        let _ = self.0.stop();
     }
 }
 
@@ -136,6 +147,13 @@ impl ChatAdapter for DiscordAdapter {
 
     fn use_streaming(&self, other_bot_present: bool) -> bool {
         !other_bot_present
+    }
+
+    fn start_typing(&self, channel: &ChannelRef) -> Option<Box<dyn TypingHandle>> {
+        let ch_id: u64 = Self::resolve_channel(channel).parse().ok()?;
+        Some(Box::new(DiscordTypingHandle(
+            ChannelId::new(ch_id).start_typing(&self.http),
+        )))
     }
 
     async fn create_thread(
