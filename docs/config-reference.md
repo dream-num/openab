@@ -105,6 +105,16 @@ The AI agent subprocess that OpenAB spawns to handle messages via ACP.
 
 > **Default inherited vars:** After `env_clear()`, the agent always receives `HOME`, `PATH`, and `USER` (on Windows: `USERPROFILE`, `USERNAME`, `PATH`, `SystemRoot`, `SystemDrive`). Use `inherit_env` to pass additional vars beyond this baseline.
 
+### Authentication
+
+Each image sets `OPENAB_AGENT_AUTH_COMMAND` with the correct auth command. To authenticate any agent:
+
+```bash
+kubectl exec -it deployment/openab-<name> -- sh -c "$OPENAB_AGENT_AUTH_COMMAND"
+```
+
+This works for all agents regardless of backend — no need to remember the specific auth command.
+
 ### Agent examples
 
 ```toml
