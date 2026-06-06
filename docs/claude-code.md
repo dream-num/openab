@@ -38,7 +38,7 @@ args = []
 Sign in interactively using the OAuth device flow. Credentials are stored on disk (persisted via PVC across pod restarts):
 
 ```bash
-kubectl exec -it deployment/openab-claude -- claude auth login
+kubectl exec -it deployment/openab-claude -- sh -c "$OPENAB_AGENT_AUTH_COMMAND"
 ```
 
 After authenticating, restart the pod so the bot process loads the new credentials:

@@ -59,7 +59,7 @@ args = ["acp"]
 ## Authentication
 
 ```bash
-kubectl exec -it deployment/openab-opencode -- opencode auth login
+kubectl exec -it deployment/openab-opencode -- sh -c "$OPENAB_AGENT_AUTH_COMMAND"
 ```
 
 Follow the browser OAuth flow, then restart the pod:

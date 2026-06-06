@@ -57,7 +57,7 @@ Get a key from <https://console.x.ai/>. No interactive login needed.
 If you want to use a SuperGrok subscription instead of pay-per-token API billing:
 
 ```bash
-kubectl exec -it <pod> -- grok login --device-auth
+kubectl exec -it <pod> -- sh -c "$OPENAB_AGENT_AUTH_COMMAND"
 ```
 
 The CLI prints a short code and URL — open the URL on any device, enter the code, approve. The token is stored at `~/.grok/auth.json` inside the container.

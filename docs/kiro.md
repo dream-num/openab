@@ -35,7 +35,7 @@ args = ["acp", "--trust-all-tools"]
 Kiro CLI requires a one-time OAuth login. The PVC persists tokens across pod restarts.
 
 ```bash
-kubectl exec -it deployment/openab-kiro -- kiro-cli login --use-device-flow
+kubectl exec -it deployment/openab-kiro -- sh -c "$OPENAB_AGENT_AUTH_COMMAND"
 ```
 
 Follow the device code flow in your browser, then restart the pod:

@@ -40,7 +40,7 @@ args = []
 ## Authentication
 
 ```bash
-kubectl exec -it deployment/openab-codex -- codex login --device-auth
+kubectl exec -it deployment/openab-codex -- sh -c "$OPENAB_AGENT_AUTH_COMMAND"
 ```
 
 Follow the device code flow in your browser, then restart the pod:
