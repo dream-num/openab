@@ -32,9 +32,9 @@ helm install openab openab/openab \
 
 ```toml
 [agent]
-command = "codex-acp"
+command = "codex-acp" # optional — defaults from OPENAB_AGENT_COMMAND
 args = []
-working_dir = "/home/node"
+working_dir = "/home/node" # optional — defaults to $HOME
 ```
 
 ## Authentication
@@ -148,9 +148,9 @@ itself, explicitly expose an upload token to the agent:
 
 ```toml
 [agent]
-command = "codex-acp"
+command = "codex-acp" # optional — defaults from OPENAB_AGENT_COMMAND
 args = []
-working_dir = "/home/node"
+working_dir = "/home/node" # optional — defaults to $HOME
 env = { DISCORD_FILE_BOT_TOKEN = "${DISCORD_FILE_BOT_TOKEN}" }
 ```
 
