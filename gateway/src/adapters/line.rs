@@ -43,6 +43,20 @@ struct LineMessage {
     text: Option<String>,
     #[serde(rename = "contentProvider")]
     content_provider: Option<LineContentProvider>,
+    mention: Option<LineMention>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LineMention {
+    mentionees: Vec<LineMentionee>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LineMentionee {
+    #[serde(rename = "userId")]
+    user_id: Option<String>,
+    #[serde(rename = "isSelf", default)]
+    is_self: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -283,6 +297,30 @@ async fn build_gateway_event_from_line_event(
         .and_then(|s| s.user_id.as_deref())
         .unwrap_or("unknown");
 
+    // Extract mentioned user IDs from the LINE webhook mention object.
+    // LINE populates this in group/room text messages when users are @-mentioned.
+    let mentionees = msg
+        .mention
+        .as_ref()
+        .map(|m| m.mentionees.as_slice())
+        .unwrap_or_default();
+    let mention_ids: Vec<String> = mentionees
+        .iter()
+        .filter_map(|m| m.user_id.clone())
+        .collect();
+
+    // @mention gating: in groups/rooms, only forward the event if the bot is mentioned.
+    // LINE sets isSelf=true on the mentionee that is the bot itself — no env var needed.
+    // 1:1 DMs always pass through.
+    let is_group = channel_type == "group" || channel_type == "room";
+    if is_group && !mentionees.iter().any(|m| m.is_self) {
+        info!(
+            channel = %channel_id,
+            "line group message dropped (@mention gating: bot not mentioned)"
+        );
+        return None;
+    }
+
     let mut gateway_event = GatewayEvent::new(
         "line",
         ChannelInfo {
@@ -298,7 +336,7 @@ async fn build_gateway_event_from_line_event(
         },
         event_text,
         &msg.id,
-        vec![],
+        mention_ids,
     );
     gateway_event.content.attachments = attachments;
     Some(gateway_event)
@@ -652,5 +690,90 @@ mod tests {
             .expect("reply token should be cached");
         assert_eq!(token, "reply123");
         assert!(cached_at.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    // --- @mention gating tests ---
+
+    fn make_group_text_event(text: &str, bot_mentioned: bool) -> LineEvent {
+        let mention = if bot_mentioned {
+            serde_json::json!({"mentionees": [{"userId": "Ubot123", "type": "user", "isSelf": true}]})
+        } else {
+            serde_json::json!({"mentionees": [{"userId": "Uother", "type": "user", "isSelf": false}]})
+        };
+        serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "source": {"type": "group", "groupId": "C001", "userId": "U_sender"},
+            "message": {
+                "id": "msg001",
+                "type": "text",
+                "text": text,
+                "mention": mention
+            }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn group_message_passes_when_bot_mentioned() {
+        let event = make_group_text_event("@Bot hello", true);
+        let result = build_gateway_event_from_line_event(
+            &event,
+            &reqwest::Client::new(),
+            None,
+            LINE_DATA_API_BASE,
+        )
+        .await;
+        assert!(result.is_some());
+        let gw = result.unwrap();
+        assert_eq!(gw.mentions, vec!["Ubot123"]);
+    }
+
+    #[tokio::test]
+    async fn group_message_dropped_when_bot_not_mentioned() {
+        let event = make_group_text_event("hey everyone", false);
+        let result = build_gateway_event_from_line_event(
+            &event,
+            &reqwest::Client::new(),
+            None,
+            LINE_DATA_API_BASE,
+        )
+        .await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn group_message_dropped_when_no_mention_at_all() {
+        let event: LineEvent = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "source": {"type": "group", "groupId": "C001", "userId": "U_sender"},
+            "message": {"id": "msg001", "type": "text", "text": "plain message no mention"}
+        }))
+        .unwrap();
+        let result = build_gateway_event_from_line_event(
+            &event,
+            &reqwest::Client::new(),
+            None,
+            LINE_DATA_API_BASE,
+        )
+        .await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn dm_passes_even_without_mention() {
+        let event: LineEvent = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "source": {"type": "user", "userId": "U_human"},
+            "message": {"id": "msg002", "type": "text", "text": "hello bot"}
+        }))
+        .unwrap();
+        let result = build_gateway_event_from_line_event(
+            &event,
+            &reqwest::Client::new(),
+            None,
+            LINE_DATA_API_BASE,
+        )
+        .await;
+        assert!(result.is_some());
     }
 }
