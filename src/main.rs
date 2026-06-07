@@ -163,9 +163,13 @@ async fn main() -> anyhow::Result<()> {
         cfg.pool.prompt_hard_timeout_secs,
         cfg.pool.liveness_check_secs,
         cfg.workspace.aliases,
-        std::path::PathBuf::from(
-            std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
-        ),
+        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| {
+            tracing::warn!(
+                "HOME environment variable is not set — falling back to /tmp as bot_home. \
+                 This weakens the workspace security boundary."
+            );
+            "/tmp".into()
+        })),
     ));
 
     // Shutdown signal for Slack adapter

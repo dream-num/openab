@@ -134,7 +134,7 @@ impl SessionPool {
     }
 
     /// Check if session state exists for this thread (active, suspended, or persisted).
-    /// Used to determine whether control directives should be parsed (first-message-only).
+    #[allow(dead_code)]
     pub async fn has_active_session(&self, thread_id: &str) -> bool {
         let state = self.state.read().await;
         // Any of these means the thread already has session state.
@@ -150,7 +150,11 @@ impl SessionPool {
         false
     }
 
-    pub async fn get_or_create(&self, thread_id: &str, working_dir_override: Option<&str>) -> Result<()> {
+    pub async fn get_or_create(
+        &self,
+        thread_id: &str,
+        working_dir_override: Option<&str>,
+    ) -> Result<bool> {
         let create_gate = {
             let mut state = self.state.write().await;
             get_or_insert_gate(&mut state.creating, thread_id)
@@ -170,7 +174,7 @@ impl SessionPool {
         if let Some(conn) = existing.clone() {
             let conn = conn.lock().await;
             if conn.alive() {
-                return Ok(());
+                return Ok(false);
             }
             if saved_session_id.is_none() {
                 saved_session_id = conn.acp_session_id.clone();
@@ -225,16 +229,6 @@ impl SessionPool {
             self.config.working_dir.clone()
         };
 
-        // Persist the workspace for future reconnects/eviction rebuilds (first time only).
-        if working_dir_override.is_some() {
-            let mut state = self.state.write().await;
-            state
-                .session_workdirs
-                .entry(thread_id.to_string())
-                .or_insert_with(|| effective_workdir.clone());
-            self.save_meta(&state.session_workdirs);
-        }
-
         // Build the replacement connection outside the state lock so one stuck
         // initialization does not block all unrelated sessions.
         let mut new_conn = AcpConnection::spawn(
@@ -284,10 +278,10 @@ impl SessionPool {
         // initializing this one.
         if let Some(existing) = state.active.get(thread_id).cloned() {
             let Ok(existing) = existing.try_lock() else {
-                return Ok(());
+                return Ok(false);
             };
             if existing.alive() {
-                return Ok(());
+                return Ok(false);
             }
             warn!(thread_id, "stale connection, rebuilding");
             drop(existing);
@@ -337,7 +331,21 @@ impl SessionPool {
                 .insert(thread_id.to_string(), (cancel_handle, cancel_session_id));
         }
         self.save_mapping(&state.persisted);
-        Ok(())
+
+        // Persist workspace override only after session spawn succeeded (口渡 F2).
+        if working_dir_override.is_some() {
+            state
+                .session_workdirs
+                .entry(thread_id.to_string())
+                .or_insert_with(|| effective_workdir.clone());
+            self.save_meta(&state.session_workdirs);
+        }
+
+        // Return true only for genuinely new sessions — not resumed or reconnected ones.
+        // A session with prior state (saved_session_id or had_existing) is a resume,
+        // even if we had to spawn a new ACP process. ADR §2.2: directives are first-message-only.
+        let is_fresh = !had_existing && saved_session_id.is_none();
+        Ok(is_fresh)
     }
 
     /// Get mutable access to a connection. Caller must have called get_or_create first.
@@ -503,10 +511,12 @@ impl SessionPool {
                     state.suspended.insert(key, sid);
                 } else {
                     state.persisted.remove(&key);
+                    state.session_workdirs.remove(&key);
                 }
             }
         }
         self.save_mapping(&state.persisted);
+        self.save_meta(&state.session_workdirs);
     }
 
     pub async fn shutdown(&self) {
@@ -589,14 +599,21 @@ mod tests {
     fn persisted_mapping_can_include_active_and_suspended_sessions() {
         let persisted = HashMap::from([
             ("active-thread".to_string(), "session-active".to_string()),
-            ("suspended-thread".to_string(), "session-suspended".to_string()),
+            (
+                "suspended-thread".to_string(),
+                "session-suspended".to_string(),
+            ),
         ]);
 
-        let serialized = serde_json::to_string_pretty(&persisted).expect("serialize persisted mapping");
+        let serialized =
+            serde_json::to_string_pretty(&persisted).expect("serialize persisted mapping");
         let roundtrip: HashMap<String, String> =
             serde_json::from_str(&serialized).expect("deserialize persisted mapping");
 
-        assert_eq!(roundtrip.get("active-thread"), Some(&"session-active".to_string()));
+        assert_eq!(
+            roundtrip.get("active-thread"),
+            Some(&"session-active".to_string())
+        );
         assert_eq!(
             roundtrip.get("suspended-thread"),
             Some(&"session-suspended".to_string())

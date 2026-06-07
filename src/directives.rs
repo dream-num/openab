@@ -46,7 +46,8 @@ pub fn parse_directives(input: &str) -> ParseResult {
         if remaining.starts_with('\n') || remaining.starts_with("\r\n") {
             // A blank line after directives = end of header
             let next = remaining.trim_start_matches(['\r', '\n']);
-            if !next.starts_with("[[") {
+            let next_trimmed = next.trim_start_matches([' ', '\t']);
+            if !next_trimmed.starts_with("[[") {
                 remaining = next;
                 break;
             }
@@ -128,13 +129,24 @@ pub fn resolve_workspace(
 
     let canonical_target = expanded.canonicalize().map_err(|e| {
         warn!(path = %expanded.display(), error = %e, "cannot canonicalize workspace path");
-        format!("Workspace path does not exist: `{path_str}`")
+        format!(
+            "Workspace path does not exist: `{path_str}` (expanded to `{}`)",
+            expanded.display()
+        )
     })?;
 
     // Rule 4+5: verify within bot home subtree
     if !canonical_target.starts_with(&canonical_home) {
         return Err(format!(
             "Workspace path is outside allowed directory: `{path_str}`"
+        ));
+    }
+
+    // Rule 6: must be a directory (not a file)
+    if !canonical_target.is_dir() {
+        return Err(format!(
+            "Workspace path is not a directory: `{}`",
+            canonical_target.display()
         ));
     }
 
@@ -169,10 +181,7 @@ mod tests {
     fn parse_preserves_body_directives() {
         let input = "[[title:Test]]\nHere is some code with [[key:value]] in it";
         let result = parse_directives(input);
-        assert_eq!(
-            result.prompt,
-            "Here is some code with [[key:value]] in it"
-        );
+        assert_eq!(result.prompt, "Here is some code with [[key:value]] in it");
         assert_eq!(result.metadata.title.as_deref(), Some("Test"));
         assert!(!result.metadata.raw.contains_key("key"));
     }

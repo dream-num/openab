@@ -124,10 +124,11 @@ pub trait DispatchTarget: Send + Sync + 'static {
     fn bot_home(&self) -> std::path::PathBuf;
 
     /// Ensure the ACP session for `session_key` exists (idempotent).
-    async fn ensure_session(&self, session_key: &str, working_dir: Option<&str>) -> Result<()>;
+    /// Returns `true` if a new session was created, `false` if it already existed.
+    async fn ensure_session(&self, session_key: &str, working_dir: Option<&str>) -> Result<bool>;
 
-    /// Check if a live session already exists for this key.
-    async fn session_exists(&self, session_key: &str) -> bool;
+    /// Destroy the session for `session_key` (used to rollback on directive failure).
+    async fn reset_session(&self, session_key: &str);
 
     /// Drive one ACP turn with the pre-packed `content_blocks`.
     #[allow(clippy::too_many_arguments)]
@@ -156,12 +157,12 @@ impl DispatchTarget for AdapterRouter {
         self.bot_home_path()
     }
 
-    async fn ensure_session(&self, session_key: &str, working_dir: Option<&str>) -> Result<()> {
+    async fn ensure_session(&self, session_key: &str, working_dir: Option<&str>) -> Result<bool> {
         self.pool().get_or_create(session_key, working_dir).await
     }
 
-    async fn session_exists(&self, session_key: &str) -> bool {
-        self.pool().has_active_session(session_key).await
+    async fn reset_session(&self, session_key: &str) {
+        let _ = self.pool().reset_session(session_key).await;
     }
 
     async fn stream_prompt_blocks(
@@ -647,39 +648,78 @@ async fn dispatch_batch(
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
 
     // Parse control directives from the first message in the batch (ADR: control-directives).
-    // Directives are only processed on the session's first message (§2.2). Skip parsing
-    // entirely if the session already exists to avoid stripping [[...]] from normal prompts.
-    let mut workspace_override: Option<String> = None;
-    let mut title_override: Option<String> = None;
+    // Directives are only processed on the session's first message (§2.2).
+    //
+    // Strategy:
+    //   1. Parse directives (cheap text extraction — no mutation, no I/O)
+    //   2. Attempt workspace resolution if [[ws:...]] present (may fail gracefully)
+    //   3. Call ensure_session with resolved workspace — returns created_now
+    //   4. Only strip prompt and apply title/workspace if created_now == true
+    //   5. If created_now == false, the [[...]] text is preserved verbatim
     let mut batch = batch;
-    if !target.session_exists(&session_key).await {
-        if let Some(first_msg) = batch.first_mut() {
-            let parse_result = crate::directives::parse_directives(&first_msg.prompt);
-            if !parse_result.metadata.raw.is_empty() {
-                first_msg.prompt = parse_result.prompt;
+    let parse_result = batch
+        .first()
+        .map(|first_msg| crate::directives::parse_directives(&first_msg.prompt));
 
-                // Resolve [[ws:...]] if present
-                if let Some(ws_value) = parse_result.metadata.raw.get("ws") {
-                    let aliases = target.workspace_aliases();
-                    let bot_home = target.bot_home();
-                    match crate::directives::resolve_workspace(ws_value, &aliases, &bot_home) {
-                        Ok(path) => {
-                            workspace_override = Some(path.display().to_string());
-                        }
-                        Err(e) => {
-                            let _ = adapter
-                                .send_message(&dispatch_channel, &format!("⚠️ {e}"))
-                                .await;
-                            error!(session_key, error = %e, "workspace directive rejected");
-                            return;
-                        }
-                    }
+    // Tentatively resolve [[ws:...]] — if resolution fails and the session turns out to
+    // be new, we abort. If the session already existed, resolution failure is irrelevant.
+    let ws_resolved: Option<Result<String, String>> = parse_result.as_ref().and_then(|pr| {
+        pr.metadata.raw.get("ws").map(|ws_value| {
+            let aliases = target.workspace_aliases();
+            let bot_home = target.bot_home();
+            crate::directives::resolve_workspace(ws_value, &aliases, &bot_home)
+                .map(|p| p.display().to_string())
+        })
+    });
+
+    // Extract workspace path for ensure_session (None if no directive or resolution failed).
+    let workspace_override: Option<String> =
+        ws_resolved.as_ref().and_then(|r| r.as_ref().ok().cloned());
+
+    // Ensure session exists. The create_gate mutex inside get_or_create serializes
+    // concurrent callers — only the winner gets created_now == true.
+    let created_now = match target
+        .ensure_session(&session_key, workspace_override.as_deref())
+        .await
+    {
+        Ok(created) => created,
+        Err(e) => {
+            let user_msg = format_user_error(&e.to_string());
+            let _ = adapter
+                .send_message(&dispatch_channel, &format!("⚠️ {user_msg}"))
+                .await;
+            error!("pool error in dispatch_batch: {e}");
+            return;
+        }
+    };
+
+    // Only apply directives if this is genuinely the first message (fresh session).
+    if created_now {
+        if let Some(pr) = parse_result {
+            if !pr.metadata.raw.is_empty() {
+                // If workspace resolution failed on a NEW session, rollback and abort.
+                // The session was created with default cwd — we must not leave it alive
+                // when the user explicitly requested a different workspace (ADR §3.1).
+                if let Some(Err(e)) = ws_resolved {
+                    target.reset_session(&session_key).await;
+                    let _ = adapter
+                        .send_message(&dispatch_channel, &format!("⚠️ {e}"))
+                        .await;
+                    error!(session_key, error = %e, "workspace directive rejected");
+                    return;
                 }
 
-                // Resolve [[title:...]] if present (non-empty value)
-                if let Some(title) = &parse_result.metadata.title {
+                // Strip directives from the prompt
+                if let Some(first_msg) = batch.first_mut() {
+                    first_msg.prompt = pr.prompt;
+                }
+
+                // Apply [[title:...]] override
+                if let Some(title) = &pr.metadata.title {
                     if !title.is_empty() {
-                        title_override = Some(title.clone());
+                        if let Err(e) = adapter.rename_thread(&dispatch_channel, title).await {
+                            warn!(session_key, error = %e, "failed to apply title directive");
+                        }
                     }
                 }
             }
@@ -692,23 +732,6 @@ async fn dispatch_batch(
         content_blocks.append(&mut event_blocks);
     }
     let packed_block_count = content_blocks.len();
-
-    // Ensure session exists.
-    if let Err(e) = target.ensure_session(&session_key, workspace_override.as_deref()).await {
-        let user_msg = format_user_error(&e.to_string());
-        let _ = adapter
-            .send_message(&dispatch_channel, &format!("⚠️ {user_msg}"))
-            .await;
-        error!("pool error in dispatch_batch: {e}");
-        return;
-    }
-
-    // Apply [[title:...]] override — rename the thread if a title directive was provided.
-    if let Some(ref title) = title_override {
-        if let Err(e) = adapter.rename_thread(&dispatch_channel, title).await {
-            warn!(session_key, error = %e, "failed to apply title directive");
-        }
-    }
 
     let reactions_config = target.reactions_config().clone();
     let reactions = Arc::new(StatusReactionController::new(
@@ -1351,16 +1374,18 @@ mod tests {
             std::path::PathBuf::from("/tmp")
         }
 
-        async fn ensure_session(&self, _session_key: &str, _working_dir: Option<&str>) -> Result<()> {
+        async fn ensure_session(
+            &self,
+            _session_key: &str,
+            _working_dir: Option<&str>,
+        ) -> Result<bool> {
             if let Some(msg) = self.ensure_err.lock().unwrap().take() {
                 return Err(anyhow::anyhow!(msg));
             }
-            Ok(())
+            Ok(true)
         }
 
-        async fn session_exists(&self, _session_key: &str) -> bool {
-            false
-        }
+        async fn reset_session(&self, _session_key: &str) {}
 
         async fn stream_prompt_blocks(
             &self,
