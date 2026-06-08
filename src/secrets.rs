@@ -11,8 +11,36 @@ pub type ResolvedSecrets = HashMap<String, String>;
 pub async fn resolve(cfg: &SecretsConfig) -> anyhow::Result<ResolvedSecrets> {
     let mut resolved = HashMap::new();
 
+    // Build AWS client once if any refs use aws-sm://
+    #[cfg(feature = "secrets-aws")]
+    let aws_client = if cfg.refs.values().any(|v| v.starts_with("aws-sm://")) {
+        Some(build_aws_client(cfg).await)
+    } else {
+        None
+    };
+
     for (key, uri) in &cfg.refs {
-        let value = resolve_one(key, uri, cfg).await?;
+        let value = if uri.starts_with("aws-sm://") {
+            #[cfg(feature = "secrets-aws")]
+            {
+                let client = aws_client.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("secret '{key}': AWS client not initialized")
+                })?;
+                resolve_aws_sm(key, uri, client).await?
+            }
+            #[cfg(not(feature = "secrets-aws"))]
+            {
+                anyhow::bail!(
+                    "secret '{key}' uses aws-sm:// but the 'secrets-aws' feature is not enabled"
+                );
+            }
+        } else if uri.starts_with("exec://") {
+            resolve_exec(key, uri, cfg).await?
+        } else {
+            anyhow::bail!(
+                "secret '{key}': unrecognized URI scheme in '{uri}' (expected aws-sm:// or exec://)"
+            );
+        };
         resolved.insert(key.clone(), value);
     }
 
@@ -22,36 +50,10 @@ pub async fn resolve(cfg: &SecretsConfig) -> anyhow::Result<ResolvedSecrets> {
     Ok(resolved)
 }
 
-async fn resolve_one(key: &str, uri: &str, cfg: &SecretsConfig) -> anyhow::Result<String> {
-    if uri.starts_with("aws-sm://") {
-        #[cfg(feature = "secrets-aws")]
-        {
-            return resolve_aws_sm(key, uri, cfg).await;
-        }
-        #[cfg(not(feature = "secrets-aws"))]
-        {
-            anyhow::bail!(
-                "secret '{key}' uses aws-sm:// but the 'secrets-aws' feature is not enabled"
-            );
-        }
-    }
-
-    if uri.starts_with("exec://") {
-        return resolve_exec(key, uri, cfg).await;
-    }
-
-    anyhow::bail!(
-        "secret '{key}': unrecognized URI scheme in '{uri}' (expected aws-sm:// or exec://)"
-    );
-}
-
 // -- AWS Secrets Manager provider --
 
 #[cfg(feature = "secrets-aws")]
-async fn resolve_aws_sm(key: &str, uri: &str, cfg: &SecretsConfig) -> anyhow::Result<String> {
-    let (secret_id, json_key) = parse_aws_sm_uri(uri)
-        .ok_or_else(|| anyhow::anyhow!("secret '{key}': invalid aws-sm:// URI '{uri}' — expected aws-sm://<secret-id>#<json-key>"))?;
-
+async fn build_aws_client(cfg: &SecretsConfig) -> aws_sdk_secretsmanager::Client {
     let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
     if let Some(ref region) = cfg.aws.region {
         config_loader = config_loader.region(aws_config::Region::new(region.clone()));
@@ -60,7 +62,17 @@ async fn resolve_aws_sm(key: &str, uri: &str, cfg: &SecretsConfig) -> anyhow::Re
         config_loader = config_loader.endpoint_url(endpoint);
     }
     let sdk_config = config_loader.load().await;
-    let client = aws_sdk_secretsmanager::Client::new(&sdk_config);
+    aws_sdk_secretsmanager::Client::new(&sdk_config)
+}
+
+#[cfg(feature = "secrets-aws")]
+async fn resolve_aws_sm(
+    key: &str,
+    uri: &str,
+    client: &aws_sdk_secretsmanager::Client,
+) -> anyhow::Result<String> {
+    let (secret_id, json_key) = parse_aws_sm_uri(uri)
+        .ok_or_else(|| anyhow::anyhow!("secret '{key}': invalid aws-sm:// URI '{uri}' — expected aws-sm://<secret-id>#<json-key>"))?;
 
     let resp = client
         .get_secret_value()
@@ -154,13 +166,15 @@ async fn resolve_exec(key: &str, uri: &str, cfg: &SecretsConfig) -> anyhow::Resu
 }
 
 /// Substitute `${secrets.<key>}` references in the raw config text with resolved values.
+/// Uses single-pass replacement to avoid double-substitution if a secret value
+/// itself contains `${secrets.*}` patterns.
 pub fn substitute(raw: &str, secrets: &ResolvedSecrets) -> String {
-    let mut result = raw.to_owned();
-    for (key, value) in secrets {
-        let placeholder = format!("${{secrets.{key}}}");
-        result = result.replace(&placeholder, value);
-    }
-    result
+    let re = regex::Regex::new(r"\$\{secrets\.([^}]+)\}").unwrap();
+    re.replace_all(raw, |caps: &regex::Captures| {
+        let key = &caps[1];
+        secrets.get(key).cloned().unwrap_or_else(|| caps[0].to_owned())
+    })
+    .into_owned()
 }
 
 #[cfg(test)]
