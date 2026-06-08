@@ -81,6 +81,11 @@ pub fn format_coded_error(code: i64, message: &str, data_message: Option<&str>) 
             out.push_str("\n> ");
             out.push_str(detail);
         }
+    } else if code == -32603 {
+        out.push_str(
+            "\n\n_The agent did not return any error details via ACP. \
+             Please check the agent's own logs for more information._",
+        );
     }
     out
 }
@@ -237,5 +242,33 @@ mod tests {
         // If data_message is already in message, don't repeat it
         let result = format_coded_error(-32603, "model not supported", Some("model not supported"));
         assert_eq!(result.matches("model not supported").count(), 1);
+    }
+
+    #[test]
+    fn format_coded_error_32603_no_detail_shows_fallback() {
+        let result = format_coded_error(-32603, "Internal error", None);
+        assert!(result.contains("Internal Error"));
+        assert!(result.contains("did not return any error details"));
+        assert!(result.contains("agent's own logs"));
+    }
+
+    #[test]
+    fn format_coded_error_32603_with_detail_no_fallback() {
+        let result = format_coded_error(-32603, "Internal error", Some("model not found"));
+        assert!(result.contains("model not found"));
+        assert!(!result.contains("did not return any error details"));
+    }
+
+    #[test]
+    fn format_coded_error_32603_empty_detail_shows_fallback() {
+        let result = format_coded_error(-32603, "Internal error", Some(""));
+        assert!(result.contains("did not return any error details"));
+    }
+
+    #[test]
+    fn format_coded_error_other_code_no_detail_no_fallback() {
+        // Fallback only applies to -32603
+        let result = format_coded_error(-32602, "bad params", None);
+        assert!(!result.contains("did not return any error details"));
     }
 }
