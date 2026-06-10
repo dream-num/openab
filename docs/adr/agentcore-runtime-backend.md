@@ -113,28 +113,51 @@ Option A remains viable for future consideration if we find the ACP translation 
 | `session/new` | Generate `runtimeSessionId` from thread key, return session_id |
 | `session/prompt` | `invoke_agent_runtime(payload={"prompt": text})` → stream response → emit ACP `notifications/content` blocks on stdout |
 | `session/load` | Resume with same `runtimeSessionId` (AgentCore auto-mounts filesystem) |
-| `cancel` | Best-effort: no direct cancel API; can `stop_runtime_session` if needed |
+| `cancel` | **Known limitation:** no mid-invoke cancel in AgentCore. Adapter responds with acknowledgement but the remote invocation continues. See §Known Limitations. |
+
+### Concurrency Control
+
+AgentCore's behavior with concurrent `InvokeAgentRuntime` calls to the same session is undefined. The adapter **must** serialize invocations per session:
+
+```
+Thread A prompt arrives → acquire per-session mutex → invoke → release
+Thread A prompt 2 arrives (while invoke in-flight) → wait for mutex → invoke
+```
+
+This matches OAB's existing invariant (I2: at most one in-flight ACP turn per thread), so in practice the mutex is a safety net, not a bottleneck.
+
+### Error Code Mapping
+
+| AgentCore Error | ACP Behavior |
+|-----------------|-------------|
+| `ThrottlingException` (429) | ACP error response `{"code": -32000, "message": "rate limited, retry later"}` |
+| `ResourceNotFoundException` (404) | ACP error `{"code": -32001, "message": "session not found"}` → OAB shows error to user |
+| `ValidationException` (400) | ACP error `{"code": -32602, "message": "invalid params: ..."}` |
+| `ServiceQuotaExceededException` (402) | ACP error `{"code": -32000, "message": "quota exceeded"}` |
+| `RuntimeClientError` (424) | ACP error `{"code": -32603, "message": "agent runtime error: ..."}` |
+| Network timeout / connection drop | Adapter emits ACP error, does NOT crash (OAB sees error, not a dead process) |
 
 ### Streaming Translation
 
-AgentCore returns `text/event-stream`:
-```
-data: I'll analyze the code...
-data: The issue is in line 42...
-data: Here's my fix:
-```
+AgentCore returns `text/event-stream` (SSE). The adapter **must** use a proper SSE parser (e.g., `httpx-sse`, `aiohttp` SSE support) — not naive `iter_lines()` — because:
+- SSE chunks may split across TCP packets (partial `data:` lines)
+- Multiple events may arrive in a single chunk
+- Keep-alive comments (`:`) must be filtered
 
-`agentcore-acp` translates each chunk to ACP JSON-RPC notification:
-```json
-{"jsonrpc":"2.0","method":"notifications/content","params":{"type":"text","text":"I'll analyze the code..."}}
-{"jsonrpc":"2.0","method":"notifications/content","params":{"type":"text","text":"The issue is in line 42..."}}
+Parsed SSE events are translated to ACP JSON-RPC notifications:
+```
+SSE:  data: I'll analyze the code...
+ACP:  {"jsonrpc":"2.0","method":"notifications/content","params":{"type":"text","text":"I'll analyze the code..."}}
+
+SSE:  data: The issue is in line 42...
+ACP:  {"jsonrpc":"2.0","method":"notifications/content","params":{"type":"text","text":"The issue is in line 42..."}}
 ```
 
 This is the same format OAB already consumes from kiro-cli, claude-agent-acp, etc. — zero changes needed in OAB's streaming/edit logic.
 
 ### Session ID Mapping
 
-AgentCore requires `runtimeSessionId` ≥ 33 characters. The adapter builds this deterministically from the ACP session context:
+AgentCore requires `runtimeSessionId` ≥ 33 characters. The adapter builds this deterministically from the ACP session context, **with guaranteed minimum length**:
 
 ```
 ACP session for Discord thread 1514294613853208667
@@ -142,7 +165,12 @@ ACP session for Discord thread 1514294613853208667
 
 ACP session for Slack thread C0123456789.1234567890.123456
   → runtimeSessionId = "oab-slack-C0123456789-1234567890-123456"  (43 chars ✓)
+
+Short thread ID (edge case): "thread-123"
+  → runtimeSessionId = "oab-discord-thread-123-000000000"  (padded to 33 chars ✓)
 ```
+
+**Length guarantee:** If the constructed ID is < 33 chars, the adapter pads with zero suffix. Alternatively, use a UUID v5 namespace hash of the thread key (always 36 chars).
 
 Deterministic mapping means:
 - No persistent state file needed in the adapter
@@ -241,7 +269,17 @@ Minimal `agentcore-acp` in Python (fastest path to validation):
 
 ---
 
-## 7. Open Questions
+## 7. Known Limitations
+
+1. **Cancel is a no-op.** AgentCore has no mid-invoke cancel API. When OAB sends `cancel`, the adapter acknowledges it but the remote invocation continues until completion. The user sees the cancel reaction (✓) but the agent keeps working. If full cancellation is needed, the adapter can call `StopRuntimeSession` — but this kills the entire session (and any in-progress filesystem writes). This is documented as a known tradeoff; operators must choose between "cancel does nothing" and "cancel nukes the session."
+
+2. **Cold start latency.** First invoke per session takes ~5-15s (microVM boot). Users see this as a pause before streaming begins. The adapter mitigates by emitting an early "Starting environment..." ACP notification.
+
+3. **8-hour max lifetime.** Sessions cannot exceed `maxLifetime` (default 8hr). Long-running work needs the adapter to transparently rotate to a new session and re-mount the same filesystem.
+
+---
+
+## 8. Open Questions
 
 1. **Payload format** — Different AgentCore runtimes may expect different payload schemas (`{"prompt": "..."}` vs raw text vs MCP). Do we need a `--payload-template` flag?
 
@@ -251,15 +289,13 @@ Minimal `agentcore-acp` in Python (fastest path to validation):
 
 4. **Cold start notification** — How should the adapter signal to OAB that the agent is booting? Options: immediate ACP notification ("Starting environment..."), or let OAB's existing stall detection handle it.
 
-5. **Cancel semantics** — AgentCore has `StopRuntimeSession` but no mid-invoke cancel. Should `cancel` kill the entire session (losing state), or just be a no-op?
+5. **Multi-agent routing** — Single adapter routing to multiple runtimes, or multiple adapter instances? Former is more convenient, latter is simpler.
 
-6. **Multi-agent routing** — Single adapter routing to multiple runtimes, or multiple adapter instances? Former is more convenient, latter is simpler.
-
-7. **Language choice for production** — Python (fast to write, boto3 native), Rust (single binary, matches OAB ecosystem), or Node.js (middle ground)?
+6. **Language choice for production** — Python (fast to write, boto3 native), Rust (single binary, matches OAB ecosystem), or Node.js (middle ground)?
 
 ---
 
-## 8. Alternatives Considered
+## 9. Alternatives Considered
 
 ### A. OAB native SDK backend (not recommended for now)
 
@@ -292,7 +328,7 @@ Use Gateway's MCP endpoint as a tool layer for local agents. Complementary (coul
 
 ---
 
-## 9. References
+## 10. References
 
 - [AWS Blog: Hosting Coding Agents on AgentCore](https://aws.amazon.com/blogs/machine-learning/its-safe-to-close-your-laptop-now-hosting-coding-agents-on-amazon-bedrock-agentcore/)
 - [InvokeAgentRuntime API Reference](https://docs.aws.amazon.com/bedrock-agentcore/latest/APIReference/API_InvokeAgentRuntime.html)
