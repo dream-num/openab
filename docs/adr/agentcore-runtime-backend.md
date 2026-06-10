@@ -271,9 +271,13 @@ Minimal `agentcore-acp` in Python (fastest path to validation):
 
 ## 7. Known Limitations
 
-1. **Cancel is a no-op.** AgentCore has no mid-invoke cancel API. When OAB sends `cancel`, the adapter acknowledges it but the remote invocation continues until completion. The user sees the cancel reaction (✓) but the agent keeps working. If full cancellation is needed, the adapter can call `StopRuntimeSession` — but this kills the entire session (and any in-progress filesystem writes). This is documented as a known tradeoff; operators must choose between "cancel does nothing" and "cancel nukes the session."
+1. **Cancel is safe for filesystem, destructive for in-memory state.** AgentCore has no mid-invoke cancel API. When OAB sends `cancel`, the adapter can call `StopRuntimeSession` which terminates the microVM. **Filesystem (`/mnt/workspace`) persists for 14 days** — files, git history, installed packages are all safe. What is lost: in-memory agent state (conversation context, running processes, partial computations). The next invoke on the same session ID mounts the same filesystem on a fresh microVM. This makes cancel = stop session a reasonable default for most coding workflows.
 
-2. **Cold start latency.** First invoke per session takes ~5-15s (microVM boot). Users see this as a pause before streaming begins. The adapter mitigates by emitting an early "Starting environment..." ACP notification.
+2. **Cold start latency (~5-15s).** First invoke per session requires microVM boot. The adapter handles this proactively: if no SSE event arrives within 3 seconds of invoking, the adapter emits an early ACP notification:
+   ```json
+   {"jsonrpc":"2.0","method":"notifications/content","params":{"type":"text","text":"⏳ Starting agent environment..."}}
+   ```
+   OAB displays this immediately, so the user knows the system is working. Once streaming begins, normal content flow takes over. This is defined behavior, not dependent on OAB's stall detection.
 
 3. **8-hour max lifetime.** Sessions cannot exceed `maxLifetime` (default 8hr). Long-running work needs the adapter to transparently rotate to a new session and re-mount the same filesystem.
 
@@ -287,11 +291,9 @@ Minimal `agentcore-acp` in Python (fastest path to validation):
 
 3. **Human-in-the-loop** — ACP supports mid-turn tool permission prompts. AgentCore agents run autonomously. Is this acceptable, or do we need a callback mechanism via the adapter?
 
-4. **Cold start notification** — How should the adapter signal to OAB that the agent is booting? Options: immediate ACP notification ("Starting environment..."), or let OAB's existing stall detection handle it.
+4. **Multi-agent routing** — Single adapter routing to multiple runtimes, or multiple adapter instances? Former is more convenient, latter is simpler.
 
-5. **Multi-agent routing** — Single adapter routing to multiple runtimes, or multiple adapter instances? Former is more convenient, latter is simpler.
-
-6. **Language choice for production** — Python (fast to write, boto3 native), Rust (single binary, matches OAB ecosystem), or Node.js (middle ground)?
+5. **Language choice for production** — Python (fast to write, boto3 native), Rust (single binary, matches OAB ecosystem), or Node.js (middle ground)?
 
 ---
 
