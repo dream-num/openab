@@ -34,14 +34,12 @@ That's it. OAB auto-spawns the bundled `agentcore-acp` adapter.
 ```toml
 [agentcore]
 runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent"  # required
-# region = "us-east-1"        # optional — auto-extracted from ARN
 cancel_strategy = "stop"       # "stop" (default) or "noop"
 ```
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `runtime_arn` | yes | — | AgentCore Runtime ARN |
-| `region` | no | extracted from ARN | Override AWS region (rarely needed) |
+| `runtime_arn` | yes | — | AgentCore Runtime ARN (region is extracted from it) |
 | `cancel_strategy` | no | `stop` | What to do on cancel: `stop` terminates the session, `noop` ignores |
 
 If you need full control, use `[agent]` directly:

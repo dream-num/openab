@@ -69,25 +69,19 @@ impl<'de> Deserialize<'de> for AllowBots {
 pub struct AgentCoreConfig {
     /// AgentCore Runtime ARN (required)
     pub runtime_arn: String,
-    /// AWS region. If omitted, extracted from runtime_arn automatically.
-    pub region: Option<String>,
     /// Cancel strategy: "noop" or "stop" (default: stop)
     #[serde(default = "default_agentcore_cancel_strategy")]
     pub cancel_strategy: AgentCoreCancelStrategy,
 }
 
 impl AgentCoreConfig {
-    /// Resolve region: explicit > extracted from ARN > fallback us-east-1
-    pub fn resolved_region(&self) -> String {
-        if let Some(ref r) = self.region {
-            return r.clone();
-        }
-        // ARN format: arn:aws:bedrock-agentcore:REGION:ACCOUNT:runtime/ID
+    /// Extract region from ARN: arn:aws:bedrock-agentcore:REGION:ACCOUNT:runtime/ID
+    pub fn region(&self) -> String {
         let parts: Vec<&str> = self.runtime_arn.split(':').collect();
         if parts.len() >= 4 && !parts[3].is_empty() {
             return parts[3].to_string();
         }
-        "us-east-1".into()
+        "us-east-1".into() // fallback (should never hit with valid ARN)
     }
 }
 
@@ -932,7 +926,7 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
                     "--runtime-arn".into(),
                     ac.runtime_arn.clone(),
                     "--region".into(),
-                    ac.resolved_region(),
+                    ac.region(),
                     "--cancel-strategy".into(),
                     ac.cancel_strategy.to_string(),
                 ],
@@ -1326,7 +1320,6 @@ bot_token = "t"
 
 [agentcore]
 runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent"
-region = "us-west-2"
 "#;
         let cfg = parse_config(toml, "test").unwrap();
         assert_eq!(cfg.agent.command, "uv");
@@ -1335,7 +1328,7 @@ region = "us-west-2"
             .agent
             .args
             .contains(&"arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent".to_string()));
-        assert!(cfg.agent.args.contains(&"us-west-2".to_string()));
+        assert!(cfg.agent.args.contains(&"us-east-1".to_string()));
     }
 
     #[test]
@@ -1365,7 +1358,7 @@ runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test"
 "#;
         let cfg = parse_config(toml, "test").unwrap();
         let ac = cfg.agentcore.unwrap();
-        assert_eq!(ac.resolved_region(), "us-east-1");
+        assert_eq!(ac.region(), "us-east-1");
         assert_eq!(ac.cancel_strategy, AgentCoreCancelStrategy::Stop);
     }
 }

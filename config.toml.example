@@ -58,7 +58,6 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # Region is auto-extracted from the ARN.
 # [agentcore]
 # runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent"
-# # region = "us-east-1"        # optional — auto-extracted from ARN
 # cancel_strategy = "stop"       # "stop" (default) or "noop"
 
 [agent]
