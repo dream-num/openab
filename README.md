@@ -197,8 +197,10 @@ allowed_channels = ["C0123456789"]   # channel ID allowlist (empty = allow all)
 # allowed_users = ["U0123456789"]    # user ID allowlist (empty = allow all)
 
 [agent]
+transport = "stdio"                  # "stdio" (default) or "websocket"
 command = "kiro-cli"                  # CLI command
 args = ["acp", "--trust-all-tools"]   # ACP mode args
+# url = "ws://stdio-to-ws:3000"       # required for websocket transport
 working_dir = "/tmp"                  # agent working directory
 env = {}                              # extra env vars passed to the agent
 

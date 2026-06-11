@@ -95,8 +95,11 @@ The AI agent subprocess that OpenAB spawns to handle messages via ACP.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `command` | string | *required* | Agent binary (e.g. `kiro-cli`, `claude-agent-acp`, `codex`, `gemini`, `copilot`, `opencode`, `pi-acp`, `cursor-agent`). |
+| `transport` | string | `"stdio"` | ACP transport: `"stdio"` (spawn a local subprocess) or `"websocket"` (connect to an ACP WebSocket endpoint). |
+| `command` | string | `""` | Agent binary for `transport = "stdio"` (e.g. `kiro-cli`, `claude-agent-acp`, `codex`, `gemini`, `copilot`, `opencode`, `pi-acp`, `cursor-agent`). Required for stdio transport. |
 | `args` | string[] | `[]` | CLI arguments passed to the agent. |
+| `url` | string | — | WebSocket URL for `transport = "websocket"` (e.g. `ws://stdio-to-ws:3000`). Required for websocket transport. |
+| `headers` | map | `{}` | Extra HTTP headers sent during the WebSocket handshake. Only used for websocket transport. |
 | `working_dir` | string | `"/tmp"` | Working directory for the agent process. |
 | `per_session_working_dir` | bool | `false` | When `true`, OpenAB creates a stable per-session subdirectory under `working_dir` and uses that as the agent cwd. Discord threads become paths like `working_dir/discord_<thread_id>`. |
 | `env` | map | `{}` | Extra environment variables (e.g. `{ OPENAI_API_KEY = "${OPENAI_API_KEY}" }`). |
@@ -162,6 +165,13 @@ working_dir = "/home/agent"
 # Hermes Agent
 [agent]
 command = "hermes-acp"
+working_dir = "/home/agent"
+
+# Remote ACP endpoint over WebSocket
+[agent]
+transport = "websocket"
+url = "ws://stdio-to-ws:3000"
+headers = { Authorization = "Bearer ${ACP_TOKEN}" }
 working_dir = "/home/agent"
 ```
 

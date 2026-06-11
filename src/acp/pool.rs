@@ -1,4 +1,4 @@
-use crate::acp::connection::AcpConnection;
+use crate::acp::connection::{AcpConnection, AcpWriter};
 use crate::acp::protocol::ConfigOption;
 use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
@@ -14,9 +14,9 @@ use tracing::{info, warn};
 struct PoolState {
     /// Active connections: thread_key → AcpConnection handle.
     active: HashMap<String, Arc<Mutex<AcpConnection>>>,
-    /// Lock-free cancel handles: thread_key → (stdin, session_id).
+    /// Lock-free cancel handles: thread_key → (writer, session_id).
     /// Stored separately so cancel can work without locking the connection.
-    cancel_handles: HashMap<String, (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String)>,
+    cancel_handles: HashMap<String, (AcpWriter, String)>,
     /// Suspended sessions: thread_key → ACP sessionId.
     /// Used at runtime to decide which thread can be resumed via `session/load`
     /// because it no longer has a live in-memory connection.
@@ -110,19 +110,34 @@ impl SessionPool {
     }
 
     fn resolve_working_dir(&self, thread_id: &str) -> Result<String> {
+        let base = PathBuf::from(&self.config.working_dir);
+
         if !self.config.per_session_working_dir {
+            if self.config.transport == crate::config::AgentTransport::Stdio {
+                anyhow::ensure!(
+                    base.is_dir(),
+                    "agent working_dir does not exist or is not a directory: {}",
+                    base.display()
+                );
+            }
             return Ok(self.config.working_dir.clone());
         }
 
-        let resolved =
-            PathBuf::from(&self.config.working_dir).join(sanitize_session_dir_component(thread_id));
-        std::fs::create_dir_all(&resolved).map_err(|e| {
-            anyhow!(
-                "failed to create per-session working_dir {}: {}",
-                resolved.display(),
-                e
-            )
-        })?;
+        let resolved = base.join(sanitize_session_dir_component(thread_id));
+        if self.config.transport == crate::config::AgentTransport::Stdio {
+            anyhow::ensure!(
+                base.is_dir(),
+                "agent working_dir does not exist or is not a directory: {}",
+                base.display()
+            );
+            std::fs::create_dir_all(&resolved).map_err(|e| {
+                anyhow!(
+                    "failed to create per-session working_dir {}: {}",
+                    resolved.display(),
+                    e
+                )
+            })?;
+        }
         Ok(resolved.to_string_lossy().into_owned())
     }
 
@@ -190,14 +205,8 @@ impl SessionPool {
         // initialization does not block all unrelated sessions.
         let resolved_working_dir = self.resolve_working_dir(thread_id)?;
 
-        let mut new_conn = AcpConnection::spawn(
-            &self.config.command,
-            &self.config.args,
-            &resolved_working_dir,
-            &self.config.env,
-            &self.config.inherit_env,
-        )
-        .await?;
+        let mut new_conn =
+            AcpConnection::spawn(&self.config, &resolved_working_dir, thread_id).await?;
 
         new_conn.initialize().await?;
 
@@ -353,7 +362,7 @@ impl SessionPool {
     /// Cancel the current in-flight operation for a session.
     /// Uses pre-stored cancel handles to avoid locking the connection (which is held during streaming).
     pub async fn cancel_session(&self, thread_id: &str) -> Result<()> {
-        let (stdin, session_id) = {
+        let (writer, session_id) = {
             let state = self.state.read().await;
             state
                 .cancel_handles
@@ -367,11 +376,7 @@ impl SessionPool {
             "params": {"sessionId": session_id}
         }))?;
         tracing::info!(session_id, "sending session/cancel");
-        use tokio::io::AsyncWriteExt;
-        let mut w = stdin.lock().await;
-        w.write_all(data.as_bytes()).await?;
-        w.write_all(b"\n").await?;
-        w.flush().await?;
+        writer.send_line(&data).await?;
         Ok(())
     }
 
@@ -383,7 +388,7 @@ impl SessionPool {
         // Send session/cancel via the lock-free stdin handle first.
         // This stops in-flight streaming even while with_connection() holds the
         // connection mutex, so the old process finishes promptly.
-        if let Some((stdin, session_id)) = {
+        if let Some((writer, session_id)) = {
             let state = self.state.read().await;
             state.cancel_handles.get(thread_id).cloned()
         } {
@@ -393,11 +398,7 @@ impl SessionPool {
                 "params": {"sessionId": session_id}
             }))?;
             tracing::info!(session_id, "reset: sending session/cancel");
-            use tokio::io::AsyncWriteExt;
-            let mut w = stdin.lock().await;
-            let _ = w.write_all(data.as_bytes()).await;
-            let _ = w.write_all(b"\n").await;
-            let _ = w.flush().await;
+            let _ = writer.send_line(&data).await;
         }
 
         let mut state = self.state.write().await;
@@ -517,7 +518,7 @@ mod tests {
     use super::{
         get_or_insert_gate, remove_if_same_handle, sanitize_session_dir_component, SessionPool,
     };
-    use crate::config::AgentConfig;
+    use crate::config::{AgentConfig, AgentTransport};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -599,8 +600,11 @@ mod tests {
     fn resolve_working_dir_uses_base_dir_by_default() {
         let pool = SessionPool::new(
             AgentConfig {
+                transport: AgentTransport::Stdio,
                 command: "echo".into(),
                 args: vec![],
+                url: None,
+                headers: HashMap::new(),
                 working_dir: "/tmp/openab-working-dir".into(),
                 per_session_working_dir: false,
                 env: HashMap::new(),
@@ -620,8 +624,11 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let pool = SessionPool::new(
             AgentConfig {
+                transport: AgentTransport::Stdio,
                 command: "echo".into(),
                 args: vec![],
+                url: None,
+                headers: HashMap::new(),
                 working_dir: tmp.path().to_string_lossy().into_owned(),
                 per_session_working_dir: true,
                 env: HashMap::new(),
@@ -636,5 +643,81 @@ mod tests {
         let expected = tmp.path().join("discord_123");
         assert_eq!(PathBuf::from(&resolved), expected);
         assert!(expected.is_dir());
+    }
+
+    #[test]
+    fn resolve_working_dir_stdio_requires_existing_base_dir() {
+        let missing = "/tmp/openab-nonexistent-working-dir-stdio";
+        let pool = SessionPool::new(
+            AgentConfig {
+                transport: AgentTransport::Stdio,
+                command: "echo".into(),
+                args: vec![],
+                url: None,
+                headers: HashMap::new(),
+                working_dir: missing.into(),
+                per_session_working_dir: false,
+                env: HashMap::new(),
+                inherit_env: vec![],
+            },
+            1,
+        );
+
+        let err = pool
+            .resolve_working_dir("discord:123")
+            .expect_err("stdio should validate local working_dir");
+        assert!(err.to_string().contains("working_dir does not exist"));
+    }
+
+    #[test]
+    fn resolve_working_dir_websocket_skips_local_validation() {
+        let missing = "/tmp/openab-nonexistent-working-dir-websocket";
+        let pool = SessionPool::new(
+            AgentConfig {
+                transport: AgentTransport::WebSocket,
+                command: String::new(),
+                args: vec![],
+                url: Some("ws://127.0.0.1:3000".into()),
+                headers: HashMap::new(),
+                working_dir: missing.into(),
+                per_session_working_dir: false,
+                env: HashMap::new(),
+                inherit_env: vec![],
+            },
+            1,
+        );
+
+        let resolved = pool
+            .resolve_working_dir("discord:123")
+            .expect("websocket should not validate local working_dir");
+        assert_eq!(resolved, missing);
+    }
+
+    #[test]
+    fn resolve_working_dir_websocket_does_not_create_per_session_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing_base = tmp.path().join("remote-only-base");
+        let expected = missing_base.join("discord_123");
+        let pool = SessionPool::new(
+            AgentConfig {
+                transport: AgentTransport::WebSocket,
+                command: String::new(),
+                args: vec![],
+                url: Some("ws://127.0.0.1:3000".into()),
+                headers: HashMap::new(),
+                working_dir: missing_base.to_string_lossy().into_owned(),
+                per_session_working_dir: true,
+                env: HashMap::new(),
+                inherit_env: vec![],
+            },
+            1,
+        );
+
+        let resolved = pool
+            .resolve_working_dir("discord:123")
+            .expect("websocket should only derive the per-session cwd string");
+        assert_eq!(PathBuf::from(&resolved), expected);
+        assert!(!expected.exists());
+        assert!(!missing_base.exists());
     }
 }

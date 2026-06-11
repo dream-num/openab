@@ -29,6 +29,32 @@ struct ProgressState {
     visible_output_started: bool,
 }
 
+async fn next_streaming_edit_candidate(
+    buf_rx: &mut tokio::sync::watch::Receiver<String>,
+    progress: &std::sync::Arc<tokio::sync::Mutex<ProgressState>>,
+) -> Option<String> {
+    let changed = match buf_rx.has_changed() {
+        Ok(changed) => changed,
+        // Sender dropped: final content is about to be written synchronously
+        // by the main task, so never emit one last stale progress frame.
+        Err(_) => return None,
+    };
+
+    if changed {
+        let content = buf_rx.borrow_and_update().clone();
+        let mut state = progress.lock().await;
+        state.visible_output_started = true;
+        Some(content)
+    } else {
+        let state = progress.lock().await;
+        if state.visible_output_started {
+            Some(String::new())
+        } else {
+            Some(progress_status_line(&state))
+        }
+    }
+}
+
 // --- Output directive parsing ---
 
 /// Parsed directives from agent output header block.
@@ -494,16 +520,19 @@ impl AdapterRouter {
         let tool_display = self.reactions_config.tool_display;
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
+        let thread_key_owned = thread_key.to_string();
 
         self.pool
             .with_connection(thread_key, |conn| {
                 let content_blocks = content_blocks.clone();
+                let thread_key = thread_key_owned.clone();
                 Box::pin(async move {
                     let reset = conn.session_reset;
                     conn.session_reset = false;
 
                     let (mut rx, request_id) = conn.session_prompt(content_blocks).await?;
                     reactions.set_thinking().await;
+                    tracing::debug!(thread_key, request_id, "stream prompt started");
 
                     let mut text_buf = String::new();
                     let mut tool_lines: Vec<ToolEntry> = Vec::new();
@@ -519,40 +548,44 @@ impl AdapterRouter {
                     }
 
                     // Streaming edit: send placeholder, spawn edit loop
-                    let (buf_tx, placeholder_msg) = if streaming {
+                    let (buf_tx, placeholder_msg, edit_loop_handle) = if streaming {
                         let initial = if reset {
                             "⚠️ _Session expired, starting fresh..._\n\n…".to_string()
                         } else {
                             "…".to_string()
                         };
                         let msg = adapter.send_message(&thread_channel, &initial).await?;
+                        tracing::debug!(
+                            thread_key,
+                            request_id,
+                            placeholder_message_id = %msg.message_id,
+                            "streaming placeholder sent"
+                        );
                         let (tx, rx) = tokio::sync::watch::channel(initial);
                         let edit_adapter = adapter.clone();
                         let edit_msg = msg.clone();
                         let limit = message_limit;
                         let mut buf_rx = rx;
                         let progress = progress.clone();
-                        tokio::spawn(async move {
+                        let thread_key = thread_key.clone();
+                        let edit_loop = tokio::spawn(async move {
                             let mut last = String::new();
                             loop {
                                 tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
-                                let changed = buf_rx.has_changed().unwrap_or(false);
-                                let candidate = if changed {
-                                    let content = buf_rx.borrow_and_update().clone();
-                                    let mut state = progress.lock().await;
-                                    state.visible_output_started = true;
-                                    content
-                                } else {
-                                    let state = progress.lock().await;
-                                    if state.visible_output_started {
-                                        String::new()
-                                    } else {
-                                        progress_status_line(&state)
-                                    }
+                                let Some(candidate) =
+                                    next_streaming_edit_candidate(&mut buf_rx, &progress).await
+                                else {
+                                    tracing::debug!(
+                                        thread_key,
+                                        request_id,
+                                        placeholder_message_id = %edit_msg.message_id,
+                                        "streaming edit loop exiting: sender closed"
+                                    );
+                                    break;
                                 };
 
                                 if !candidate.is_empty() && candidate != last {
-                                    let display = if candidate.chars().count() > limit - 100 {
+                                    let display_content = if candidate.chars().count() > limit - 100 {
                                         format!(
                                             "…{}",
                                             format::truncate_chars_tail(&candidate, limit - 100)
@@ -560,17 +593,22 @@ impl AdapterRouter {
                                     } else {
                                         candidate.clone()
                                     };
-                                    let _ = edit_adapter.edit_message(&edit_msg, &display).await;
+                                    tracing::debug!(
+                                        thread_key,
+                                        request_id,
+                                        placeholder_message_id = %edit_msg.message_id,
+                                        candidate_len = candidate.len(),
+                                        display_len = display_content.len(),
+                                        "streaming placeholder edit"
+                                    );
+                                    let _ = edit_adapter.edit_message(&edit_msg, &display_content).await;
                                     last = candidate;
-                                }
-                                if buf_rx.has_changed().is_err() {
-                                    break;
                                 }
                             }
                         });
-                        (Some(tx), Some(msg))
+                        (Some(tx), Some(msg), Some(edit_loop))
                     } else {
-                        (None, None)
+                        (None, None, None)
                     };
 
                     // (#732) Liveness-aware recv loop. Filters stale id-bearing
@@ -703,6 +741,11 @@ impl AdapterRouter {
                     conn.prompt_done().await;
                     // Stop the edit loop
                     drop(buf_tx);
+                    if let Some(handle) = edit_loop_handle {
+                        tracing::debug!(thread_key, request_id, "aborting streaming edit loop");
+                        handle.abort();
+                        let _ = handle.await;
+                    }
 
                     // Parse output directives from raw text_buf BEFORE compose_display.
                     // Directives are agent meta-layer, not content — must be stripped
@@ -714,12 +757,12 @@ impl AdapterRouter {
                     let final_content =
                         compose_display(&tool_lines, &text_buf, false, tool_display);
                     let final_content = if final_content.is_empty() {
-                        if let Some(err) = response_error {
+                        if let Some(ref err) = response_error {
                             format!("⚠️ {err}")
                         } else {
                             "_(no response)_".to_string()
                         }
-                    } else if let Some(err) = response_error {
+                    } else if let Some(ref err) = response_error {
                         format!("⚠️ {err}\n\n{final_content}")
                     } else {
                         final_content
@@ -727,6 +770,15 @@ impl AdapterRouter {
 
                     let final_content = markdown::convert_tables(&final_content, table_mode);
                     let chunks = format::split_message(&final_content, message_limit);
+                    let has_response_error = response_error.is_some();
+                    tracing::debug!(
+                        thread_key,
+                        request_id,
+                        chunk_count = chunks.len(),
+                        final_content_len = final_content.len(),
+                        response_error = has_response_error,
+                        "final response prepared"
+                    );
                     if let Some(msg) = placeholder_msg {
                         if let Some(ref reply_id) = directives.reply_to {
                             // reply_to directive: send reply first, then delete placeholder.
@@ -758,6 +810,13 @@ impl AdapterRouter {
                         } else {
                             // Normal streaming: edit first chunk into placeholder, send rest
                             if let Some(first) = chunks.first() {
+                                tracing::debug!(
+                                    thread_key,
+                                    request_id,
+                                    placeholder_message_id = %msg.message_id,
+                                    first_chunk_len = first.len(),
+                                    "writing final response into placeholder"
+                                );
                                 let _ = adapter.edit_message(&msg, first).await;
                             }
                             for chunk in chunks.iter().skip(1) {
@@ -970,6 +1029,7 @@ fn compose_display(
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+    use tokio::sync::watch;
 
     fn progress_state(phase: ProgressPhase, elapsed_secs: u64, idle_secs: u64) -> ProgressState {
         let now = Instant::now();
@@ -1009,6 +1069,31 @@ mod tests {
     fn progress_status_still_working() {
         let state = progress_state(ProgressPhase::Thinking, 52, 46);
         assert_eq!(progress_status_line(&state), "⚠️ Still working... 52s");
+    }
+
+    #[tokio::test]
+    async fn rapid_response_shutdown_does_not_emit_final_thinking_frame() {
+        let progress = std::sync::Arc::new(tokio::sync::Mutex::new(progress_state(
+            ProgressPhase::Thinking,
+            2,
+            2,
+        )));
+        let (tx, mut rx) = watch::channel("…".to_string());
+
+        let first = next_streaming_edit_candidate(&mut rx, &progress)
+            .await
+            .expect("progress frame before output");
+        assert_eq!(first, "⏳ Thinking... 2s");
+
+        tx.send("hi".to_string()).expect("send final content");
+        let second = next_streaming_edit_candidate(&mut rx, &progress)
+            .await
+            .expect("content frame");
+        assert_eq!(second, "hi");
+
+        drop(tx);
+        let third = next_streaming_edit_candidate(&mut rx, &progress).await;
+        assert_eq!(third, None, "closed sender must not emit Thinking again");
     }
 
     /// Compile-time regression guard: use_streaming() is a required trait method

@@ -355,9 +355,15 @@ fn default_gateway_platform() -> String {
 
 #[derive(Debug, Deserialize)]
 pub struct AgentConfig {
+    #[serde(default)]
+    pub transport: AgentTransport,
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
     #[serde(default = "default_working_dir")]
     pub working_dir: String,
     #[serde(default)]
@@ -366,6 +372,27 @@ pub struct AgentConfig {
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub inherit_env: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentTransport {
+    #[default]
+    Stdio,
+    WebSocket,
+}
+
+impl<'de> Deserialize<'de> for AgentTransport {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().replace('-', "_").as_str() {
+            "stdio" => Ok(Self::Stdio),
+            "websocket" | "ws" => Ok(Self::WebSocket),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["stdio", "websocket"],
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -686,6 +713,25 @@ fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
     let config: Config = toml::from_str(&expanded)
         .map_err(|e| anyhow::anyhow!("failed to parse config from {source}: {e}"))?;
 
+    match config.agent.transport {
+        AgentTransport::Stdio => {
+            anyhow::ensure!(
+                !config.agent.command.trim().is_empty(),
+                "agent.command is required when agent.transport = \"stdio\""
+            );
+        }
+        AgentTransport::WebSocket => {
+            anyhow::ensure!(
+                config
+                    .agent
+                    .url
+                    .as_deref()
+                    .is_some_and(|url| !url.trim().is_empty()),
+                "agent.url is required when agent.transport = \"websocket\""
+            );
+        }
+    }
+
     // Validate max_buffered_messages > 0 (tokio::sync::mpsc::channel panics on 0)
     // and max_batch_tokens > 0 (otherwise the consumer's token-cap check forces every
     // batch to size 1 — functionally per-message via a confusing path).
@@ -742,6 +788,7 @@ command = "echo"
         let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
         assert_eq!(cfg.discord.unwrap().bot_token, "test-token");
         assert_eq!(cfg.agent.command, "echo");
+        assert_eq!(cfg.agent.transport, AgentTransport::Stdio);
         assert!(!cfg.agent.per_session_working_dir);
         assert_eq!(cfg.pool.max_sessions, 10);
         assert!(cfg.reactions.enabled);
@@ -759,6 +806,53 @@ per_session_working_dir = true
 "#;
         let cfg = parse_config(toml, "test").unwrap();
         assert!(cfg.agent.per_session_working_dir);
+    }
+
+    #[test]
+    fn parse_websocket_agent_config() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+transport = "websocket"
+url = "ws://127.0.0.1:3000"
+headers = { Authorization = "Bearer token" }
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(cfg.agent.transport, AgentTransport::WebSocket);
+        assert_eq!(cfg.agent.url.as_deref(), Some("ws://127.0.0.1:3000"));
+        assert_eq!(
+            cfg.agent.headers.get("Authorization").map(String::as_str),
+            Some("Bearer token")
+        );
+        assert!(cfg.agent.command.is_empty());
+    }
+
+    #[test]
+    fn websocket_agent_requires_url() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+transport = "websocket"
+"#;
+        let err = parse_config(toml, "test").unwrap_err().to_string();
+        assert!(err.contains("agent.url is required"));
+    }
+
+    #[test]
+    fn stdio_agent_requires_command() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+transport = "stdio"
+"#;
+        let err = parse_config(toml, "test").unwrap_err().to_string();
+        assert!(err.contains("agent.command is required"));
     }
 
     #[test]
