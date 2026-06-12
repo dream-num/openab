@@ -413,15 +413,15 @@ fn section_agent() -> (String, String, bool) {
 // Section 4: Pool Settings
 // ---------------------------------------------------------------------------
 
-fn section_pool() -> (usize, u64) {
+fn section_pool() -> (usize, f64) {
     println!();
     cprintln!(C.bold, "--- Step 4: Session Pool ---");
     println!();
 
     let max_sessions: usize = prompt_default("  Max sessions", "10").parse().unwrap_or(10);
-    let ttl_hours: u64 = prompt_default("  Session TTL (hours)", "24")
+    let ttl_hours: f64 = prompt_default("  Session TTL (hours)", "24")
         .parse()
-        .unwrap_or(24);
+        .unwrap_or(24.0);
 
     cprintln!(
         C.green,

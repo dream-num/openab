@@ -184,7 +184,7 @@ Session pool settings for managing concurrent agent sessions.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `max_sessions` | usize | `10` | Maximum number of concurrent agent sessions. When full, the oldest idle session is suspended (recoverable); if all sessions are busy, new requests are rejected. |
-| `session_ttl_hours` | u64 | `4` | Session time-to-live in hours. Idle sessions are reclaimed after this period. The example config uses `24`. |
+| `session_ttl_hours` | float | `4.0` | Session time-to-live in hours. Supports fractional values such as `0.5` for 30 minutes. Idle sessions are reclaimed after this period. The example config uses `24`. |
 
 ---
 

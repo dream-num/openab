@@ -240,27 +240,39 @@ impl SessionPool {
         let cancel_session_id = new_conn.acp_session_id.clone().unwrap_or_default();
         let new_conn = Arc::new(Mutex::new(new_conn));
 
-        let mut state = self.state.write().await;
+        let stale_conn = {
+            let mut state = self.state.write().await;
 
-        // Another task may have created a healthy connection while we were
-        // initializing this one.
-        if let Some(existing) = state.active.get(thread_id).cloned() {
-            let Ok(existing) = existing.try_lock() else {
-                return Ok(());
-            };
-            if existing.alive() {
-                return Ok(());
+            // Another task may have created a healthy connection while we were
+            // initializing this one.
+            if let Some(existing) = state.active.get(thread_id).cloned() {
+                let Ok(existing) = existing.try_lock() else {
+                    return Ok(());
+                };
+                if existing.alive() {
+                    return Ok(());
+                }
+                warn!(thread_id, "stale connection, rebuilding");
+                drop(existing);
+                state.cancel_handles.remove(thread_id);
+                state.active.remove(thread_id)
+            } else {
+                None
             }
-            warn!(thread_id, "stale connection, rebuilding");
-            drop(existing);
-            state.active.remove(thread_id);
-            state.cancel_handles.remove(thread_id);
+        };
+        if let Some(stale_conn) = stale_conn {
+            let mut stale_conn = stale_conn.lock().await;
+            stale_conn.close_transport().await;
         }
 
+        let mut state = self.state.write().await;
+
+        let mut retired = Vec::new();
         if state.active.len() >= self.max_sessions {
             if let Some((key, expected_conn, _, sid)) = eviction_candidate {
                 if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
                     state.cancel_handles.remove(&key);
+                    retired.push(expected_conn);
                     info!(evicted = %key, "pool full, suspending oldest idle session");
                     if let Some(sid) = sid {
                         state.persisted.insert(key.clone(), sid.clone());
@@ -299,6 +311,11 @@ impl SessionPool {
                 .insert(thread_id.to_string(), (cancel_handle, cancel_session_id));
         }
         self.save_mapping(&state.persisted);
+        drop(state);
+        for conn in retired {
+            let mut conn = conn.lock().await;
+            conn.close_transport().await;
+        }
         Ok(())
     }
 
@@ -402,12 +419,18 @@ impl SessionPool {
         }
 
         let mut state = self.state.write().await;
-        let had_active = state.active.remove(thread_id).is_some();
+        let removed = state.active.remove(thread_id);
+        let had_active = removed.is_some();
         state.cancel_handles.remove(thread_id);
         state.suspended.remove(thread_id);
         state.persisted.remove(thread_id);
         state.creating.remove(thread_id);
         self.save_mapping(&state.persisted);
+        drop(state);
+        if let Some(conn) = removed {
+            let mut conn = conn.lock().await;
+            conn.close_transport().await;
+        }
         if had_active {
             info!(thread_id, "session reset");
             Ok(())
@@ -416,8 +439,8 @@ impl SessionPool {
         }
     }
 
-    pub async fn cleanup_idle(&self, ttl_secs: u64) {
-        let cutoff = Instant::now() - std::time::Duration::from_secs(ttl_secs);
+    pub async fn cleanup_idle(&self, ttl: std::time::Duration) {
+        let cutoff = Instant::now() - ttl;
 
         let snapshot: Vec<(String, Arc<Mutex<AcpConnection>>)> = {
             let state = self.state.read().await;
@@ -446,10 +469,12 @@ impl SessionPool {
         }
 
         let mut state = self.state.write().await;
+        let mut retired = Vec::new();
         for (key, expected_conn, sid) in stale {
             if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
                 info!(thread_id = %key, "cleaning up idle session");
                 state.cancel_handles.remove(&key);
+                retired.push(expected_conn);
                 if let Some(sid) = sid {
                     state.persisted.insert(key.clone(), sid.clone());
                     state.suspended.insert(key, sid);
@@ -459,6 +484,11 @@ impl SessionPool {
             }
         }
         self.save_mapping(&state.persisted);
+        drop(state);
+        for conn in retired {
+            let mut conn = conn.lock().await;
+            conn.close_transport().await;
+        }
     }
 
     pub async fn shutdown(&self) {
@@ -475,10 +505,10 @@ impl SessionPool {
         };
 
         let mut session_ids: Vec<(String, String)> = Vec::new();
-        for (key, conn) in snapshot {
+        for (key, conn) in &snapshot {
             let conn = conn.lock().await;
             if let Some(sid) = conn.acp_session_id.clone() {
-                session_ids.push((key, sid));
+                session_ids.push((key.clone(), sid));
             }
         }
 
@@ -491,6 +521,11 @@ impl SessionPool {
         let count = state.active.len();
         state.active.clear();
         state.cancel_handles.clear();
+        drop(state);
+        for (_, conn) in snapshot {
+            let mut conn = conn.lock().await;
+            conn.close_transport().await;
+        }
         info!(count, "pool shutdown complete");
     }
 }

@@ -400,7 +400,7 @@ pub struct PoolConfig {
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
     #[serde(default = "default_ttl_hours")]
-    pub session_ttl_hours: u64,
+    pub session_ttl_hours: f64,
     /// Hard ceiling for a single prompt (#732). Once exceeded, the broker
     /// abandons the in-flight request, sends `session/cancel` to the agent,
     /// and clears the pending entry so late responses cannot leak into the
@@ -549,8 +549,8 @@ fn default_working_dir() -> String {
 fn default_max_sessions() -> usize {
     10
 }
-fn default_ttl_hours() -> u64 {
-    4
+fn default_ttl_hours() -> f64 {
+    4.0
 }
 pub(crate) fn default_prompt_hard_timeout_secs() -> u64 {
     30 * 60
@@ -766,6 +766,10 @@ fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
         config.pool.liveness_check_secs > 0,
         "pool.liveness_check_secs must be > 0 (zero would spin the recv loop)"
     );
+    anyhow::ensure!(
+        config.pool.session_ttl_hours > 0.0,
+        "pool.session_ttl_hours must be > 0"
+    );
 
     Ok(config)
 }
@@ -791,7 +795,40 @@ command = "echo"
         assert_eq!(cfg.agent.transport, AgentTransport::Stdio);
         assert!(!cfg.agent.per_session_working_dir);
         assert_eq!(cfg.pool.max_sessions, 10);
+        assert_eq!(cfg.pool.session_ttl_hours, 4.0);
         assert!(cfg.reactions.enabled);
+    }
+
+    #[test]
+    fn parse_fractional_session_ttl_hours() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[pool]
+session_ttl_hours = 0.5
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(cfg.pool.session_ttl_hours, 0.5);
+    }
+
+    #[test]
+    fn reject_non_positive_session_ttl_hours() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[pool]
+session_ttl_hours = 0
+
+[agent]
+command = "echo"
+"#;
+        let err = parse_config(toml, "test").unwrap_err().to_string();
+        assert!(err.contains("pool.session_ttl_hours must be > 0"));
     }
 
     #[test]

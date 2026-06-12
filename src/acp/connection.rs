@@ -140,6 +140,13 @@ impl AcpWriter {
         }
         Ok(())
     }
+
+    pub async fn close(&self) {
+        if let Self::WebSocket(ws) = self {
+            let mut w = ws.lock().await;
+            let _ = w.send(Message::Close(None)).await;
+        }
+    }
 }
 
 pub struct AcpConnection {
@@ -873,6 +880,15 @@ impl AcpConnection {
         !self._reader_handle.is_finished()
     }
 
+    pub async fn close_transport(&mut self) {
+        self.writer.close().await;
+        self._reader_handle.abort();
+        if let Some(handle) = self._stderr_handle.take() {
+            handle.abort();
+        }
+        finish_reader_loop(self.pending.clone(), self.notify_tx.clone()).await;
+    }
+
     /// Resume a previous session by ID. Returns Ok(()) if the agent accepted
     /// the load, or an error if it failed (caller should fall back to session/new).
     pub async fn session_load(&mut self, session_id: &str, cwd: &str) -> Result<()> {
@@ -925,6 +941,7 @@ impl AcpConnection {
 
 impl Drop for AcpConnection {
     fn drop(&mut self) {
+        self._reader_handle.abort();
         if let Some(handle) = self._stderr_handle.take() {
             handle.abort();
         }
