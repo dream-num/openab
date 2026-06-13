@@ -50,3 +50,6 @@ agentcore = ["dep:aws-config", "dep:aws-sigv4", "dep:aws-credential-types", "dep
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[patch.crates-io]
+serenity = { path = "vendor/serenity-0.12.5" }

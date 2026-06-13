@@ -1190,9 +1190,13 @@ mod tests {
         // otherwise we fall back to building one with a dummy SessionPool.
         use crate::acp::SessionPool;
         let agent_cfg = crate::config::AgentConfig {
+            transport: crate::config::AgentTransport::Stdio,
             command: "/bin/true".into(),
             args: vec![],
+            url: None,
+            headers: std::collections::HashMap::new(),
             working_dir: "/tmp".into(),
+            per_session_working_dir: false,
             env: std::collections::HashMap::new(),
             inherit_env: vec![],
             command_explicit: true,

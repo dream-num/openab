@@ -11,6 +11,50 @@ use crate::format;
 use crate::markdown::{self, TableMode};
 use crate::reactions::StatusReactionController;
 
+pub trait TypingHandle: Send {
+    fn stop(self: Box<Self>);
+}
+
+#[derive(Debug, Clone)]
+enum ProgressPhase {
+    Thinking,
+    Tool(String),
+}
+
+#[derive(Debug)]
+struct ProgressState {
+    phase: ProgressPhase,
+    started_at: std::time::Instant,
+    last_update_at: std::time::Instant,
+    visible_output_started: bool,
+}
+
+async fn next_streaming_edit_candidate(
+    buf_rx: &mut tokio::sync::watch::Receiver<String>,
+    progress: &std::sync::Arc<tokio::sync::Mutex<ProgressState>>,
+) -> Option<String> {
+    let changed = match buf_rx.has_changed() {
+        Ok(changed) => changed,
+        // Sender dropped: final content is about to be written synchronously
+        // by the main task, so never emit one last stale progress frame.
+        Err(_) => return None,
+    };
+
+    if changed {
+        let content = buf_rx.borrow_and_update().clone();
+        let mut state = progress.lock().await;
+        state.visible_output_started = true;
+        Some(content)
+    } else {
+        let state = progress.lock().await;
+        if state.visible_output_started {
+            Some(String::new())
+        } else {
+            Some(progress_status_line(&state))
+        }
+    }
+}
+
 // --- Output directive parsing ---
 
 /// Parsed directives from agent output header block.
@@ -39,7 +83,12 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
                         "reply_to" => {
                             let v = value.trim();
                             // Validate: non-empty, reasonable length, no whitespace/control chars
-                            if !v.is_empty() && v.len() <= 64 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_') {
+                            if !v.is_empty()
+                                && v.len() <= 64
+                                && v.chars().all(|c| {
+                                    c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'
+                                })
+                            {
                                 directives.reply_to = Some(v.to_string());
                             }
                         }
@@ -324,6 +373,12 @@ pub trait ChatAdapter: Send + Sync + 'static {
     /// not be detected until the next message. This is acceptable: the first
     /// response may stream, but subsequent ones will correctly use send-once.
     fn use_streaming(&self, other_bot_present: bool) -> bool;
+
+    /// Start a platform-native typing indicator for a long-running turn.
+    /// Default: unsupported / no-op.
+    fn start_typing(&self, _channel: &ChannelRef) -> Option<Box<dyn TypingHandle>> {
+        None
+    }
 }
 
 // --- AdapterRouter ---
@@ -556,6 +611,7 @@ impl AdapterRouter {
         let thread_channel = thread_channel.clone();
         let message_limit = adapter.message_limit();
         let streaming = adapter.use_streaming(other_bot_present);
+        let typing = adapter.start_typing(&thread_channel);
         let native = adapter.uses_native_streaming(other_bot_present);
         let assistant_status = adapter.uses_assistant_status();
         // Platforms that render Markdown tables natively (e.g. Slack Block Kit
@@ -569,10 +625,12 @@ impl AdapterRouter {
         let tool_display = self.reactions_config.tool_display;
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
+        let thread_key_owned = thread_key.to_string();
 
         self.pool
             .with_connection(thread_key, |conn| {
                 let content_blocks = content_blocks.clone();
+                let thread_key = thread_key_owned.clone();
                 Box::pin(async move {
                     let reset = conn.session_reset;
                     conn.session_reset = false;
@@ -583,9 +641,16 @@ impl AdapterRouter {
                     } else {
                         reactions.set_thinking().await;
                     }
+                    tracing::debug!(thread_key, request_id, "stream prompt started");
 
                     let mut text_buf = String::new();
                     let mut tool_lines: Vec<ToolEntry> = Vec::new();
+                    let progress = std::sync::Arc::new(tokio::sync::Mutex::new(ProgressState {
+                        phase: ProgressPhase::Thinking,
+                        started_at: std::time::Instant::now(),
+                        last_update_at: std::time::Instant::now(),
+                        visible_output_started: false,
+                    }));
 
                     if reset {
                         text_buf.push_str("⚠️ _Session expired, starting fresh..._\n\n");
@@ -603,46 +668,67 @@ impl AdapterRouter {
                     const NATIVE_FLUSH_MS: u128 = 400;
 
                     // Streaming edit: send placeholder, spawn edit loop
-                    let (buf_tx, placeholder_msg) = if streaming && !native {
+                    let (buf_tx, placeholder_msg, edit_loop_handle) = if streaming && !native {
                         let initial = if reset {
                             "⚠️ _Session expired, starting fresh..._\n\n…".to_string()
                         } else {
                             "…".to_string()
                         };
                         let msg = adapter.send_message(&thread_channel, &initial).await?;
+                        tracing::debug!(
+                            thread_key,
+                            request_id,
+                            placeholder_message_id = %msg.message_id,
+                            "streaming placeholder sent"
+                        );
                         let (tx, rx) = tokio::sync::watch::channel(initial);
                         let edit_adapter = adapter.clone();
                         let edit_msg = msg.clone();
                         let limit = message_limit;
                         let mut buf_rx = rx;
-                        tokio::spawn(async move {
+                        let progress = progress.clone();
+                        let thread_key = thread_key.clone();
+                        let edit_loop = tokio::spawn(async move {
                             let mut last = String::new();
                             loop {
-                                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                                if buf_rx.has_changed().unwrap_or(false) {
-                                    let content = buf_rx.borrow_and_update().clone();
-                                    if content != last {
-                                        let display = if content.chars().count() > limit - 100 {
-                                            format!(
-                                                "…{}",
-                                                format::truncate_chars_tail(&content, limit - 100)
-                                            )
-                                        } else {
-                                            content.clone()
-                                        };
-                                        let _ =
-                                            edit_adapter.edit_message(&edit_msg, &display).await;
-                                        last = content;
-                                    }
-                                }
-                                if buf_rx.has_changed().is_err() {
+                                tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+                                let Some(candidate) =
+                                    next_streaming_edit_candidate(&mut buf_rx, &progress).await
+                                else {
+                                    tracing::debug!(
+                                        thread_key,
+                                        request_id,
+                                        placeholder_message_id = %edit_msg.message_id,
+                                        "streaming edit loop exiting: sender closed"
+                                    );
                                     break;
+                                };
+
+                                if !candidate.is_empty() && candidate != last {
+                                    let display_content = if candidate.chars().count() > limit - 100 {
+                                        format!(
+                                            "…{}",
+                                            format::truncate_chars_tail(&candidate, limit - 100)
+                                        )
+                                    } else {
+                                        candidate.clone()
+                                    };
+                                    tracing::debug!(
+                                        thread_key,
+                                        request_id,
+                                        placeholder_message_id = %edit_msg.message_id,
+                                        candidate_len = candidate.len(),
+                                        display_len = display_content.len(),
+                                        "streaming placeholder edit"
+                                    );
+                                    let _ = edit_adapter.edit_message(&edit_msg, &display_content).await;
+                                    last = candidate;
                                 }
                             }
                         });
-                        (Some(tx), Some(msg))
+                        (Some(tx), Some(msg), Some(edit_loop))
                     } else {
-                        (None, None)
+                        (None, None, None)
                     };
 
                     // (#732) Liveness-aware recv loop. Filters stale id-bearing
@@ -693,6 +779,7 @@ impl AdapterRouter {
                             match event {
                                 AcpEvent::Text(t) => {
                                     text_buf.push_str(&t);
+                                    touch_progress(&progress, None).await;
                                     if native {
                                         // Lazy stream_begin: open the stream on first text.
                                         if native_msg.is_none() && !stream_begin_failed {
@@ -734,6 +821,7 @@ impl AdapterRouter {
                                     } else {
                                         reactions.set_thinking().await;
                                     }
+                                    touch_progress(&progress, Some(ProgressPhase::Thinking)).await;
                                 }
                                 AcpEvent::ToolStart { id, title } if !title.is_empty() => {
                                     // Live indicator: assistant status line vs emoji reaction.
@@ -753,6 +841,11 @@ impl AdapterRouter {
                                     // the reply, so without this the message would retain no record
                                     // of which tools ran.
                                     let title = sanitize_title(&title);
+                                    touch_progress(
+                                        &progress,
+                                        Some(ProgressPhase::Tool(title.clone())),
+                                    )
+                                    .await;
                                     if let Some(slot) =
                                         tool_lines.iter_mut().find(|e| e.id == id)
                                     {
@@ -786,6 +879,7 @@ impl AdapterRouter {
                                     }
                                     // Update the tool's state in BOTH modes (see ToolStart) so the
                                     // finalized message's tool summary reflects completion/failure.
+                                    touch_progress(&progress, Some(ProgressPhase::Thinking)).await;
                                     let new_state = if status == "completed" {
                                         ToolState::Completed
                                     } else {
@@ -816,6 +910,7 @@ impl AdapterRouter {
                                 }
                                 AcpEvent::ConfigUpdate { options } => {
                                     conn.config_options = options;
+                                    touch_progress(&progress, None).await;
                                 }
                                 _ => {}
                             }
@@ -825,6 +920,11 @@ impl AdapterRouter {
                     conn.prompt_done().await;
                     // Stop the edit loop
                     drop(buf_tx);
+                    if let Some(handle) = edit_loop_handle {
+                        tracing::debug!(thread_key, request_id, "aborting streaming edit loop");
+                        handle.abort();
+                        let _ = handle.await;
+                    }
 
                     // Parse output directives from raw text_buf BEFORE compose_display.
                     // Directives are agent meta-layer, not content — must be stripped
@@ -836,12 +936,12 @@ impl AdapterRouter {
                     let final_content =
                         compose_display(&tool_lines, &text_buf, false, tool_display);
                     let final_content = if final_content.is_empty() {
-                        if let Some(err) = response_error {
+                        if let Some(ref err) = response_error {
                             format!("⚠️ {err}")
                         } else {
                             "_(no response)_".to_string()
                         }
-                    } else if let Some(err) = response_error {
+                    } else if let Some(ref err) = response_error {
                         format!("⚠️ {err}\n\n{final_content}")
                     } else {
                         final_content
@@ -849,6 +949,15 @@ impl AdapterRouter {
 
                     let final_content = markdown::convert_tables(&final_content, table_mode);
                     let chunks = format::split_message(&final_content, message_limit);
+                    let has_response_error = response_error.is_some();
+                    tracing::debug!(
+                        thread_key,
+                        request_id,
+                        chunk_count = chunks.len(),
+                        final_content_len = final_content.len(),
+                        response_error = has_response_error,
+                        "final response prepared"
+                    );
                     // Clear the assistant status line before delivering the final message.
                     if assistant_status {
                         let _ = adapter.set_status(&thread_channel, "").await;
@@ -918,6 +1027,13 @@ impl AdapterRouter {
                         } else {
                             // Normal streaming: edit first chunk into placeholder, send rest
                             if let Some(first) = chunks.first() {
+                                tracing::debug!(
+                                    thread_key,
+                                    request_id,
+                                    placeholder_message_id = %msg.message_id,
+                                    first_chunk_len = first.len(),
+                                    "writing final response into placeholder"
+                                );
                                 let _ = adapter.edit_message(&msg, first).await;
                             }
                             for chunk in chunks.iter().skip(1) {
@@ -946,6 +1062,10 @@ impl AdapterRouter {
                         }
                     }
 
+                    if let Some(typing) = typing {
+                        typing.stop();
+                    }
+
                     Ok(())
                 })
             })
@@ -959,6 +1079,41 @@ fn sanitize_title(title: &str) -> String {
         .replace('\r', "")
         .replace('\n', " ; ")
         .replace('`', "'")
+}
+
+async fn touch_progress(
+    progress: &std::sync::Arc<tokio::sync::Mutex<ProgressState>>,
+    phase: Option<ProgressPhase>,
+) {
+    let mut state = progress.lock().await;
+    if let Some(phase) = phase {
+        state.phase = phase;
+    }
+    state.last_update_at = std::time::Instant::now();
+}
+
+fn progress_status_line(state: &ProgressState) -> String {
+    let elapsed = state.started_at.elapsed().as_secs();
+    let idle = state.last_update_at.elapsed().as_secs();
+
+    if idle >= 45 {
+        return format!("⚠️ Still working... {elapsed}s");
+    }
+    if idle >= 15 {
+        return format!("⏳ Waiting for agent output... {elapsed}s");
+    }
+
+    match &state.phase {
+        ProgressPhase::Thinking => format!("⏳ Thinking... {elapsed}s"),
+        ProgressPhase::Tool(title) => {
+            let title = if title.chars().count() > 60 {
+                format!("{}...", title.chars().take(57).collect::<String>())
+            } else {
+                title.clone()
+            };
+            format!("🔧 Running `{title}`... {elapsed}s")
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1090,6 +1245,73 @@ fn compose_display(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+    use tokio::sync::watch;
+
+    fn progress_state(phase: ProgressPhase, elapsed_secs: u64, idle_secs: u64) -> ProgressState {
+        let now = Instant::now();
+        ProgressState {
+            phase,
+            started_at: now - Duration::from_secs(elapsed_secs),
+            last_update_at: now - Duration::from_secs(idle_secs),
+            visible_output_started: false,
+        }
+    }
+
+    #[test]
+    fn progress_status_thinking() {
+        let state = progress_state(ProgressPhase::Thinking, 12, 3);
+        assert_eq!(progress_status_line(&state), "⏳ Thinking... 12s");
+    }
+
+    #[test]
+    fn progress_status_tool() {
+        let state = progress_state(ProgressPhase::Tool("exec_command".into()), 38, 4);
+        assert_eq!(
+            progress_status_line(&state),
+            "🔧 Running `exec_command`... 38s"
+        );
+    }
+
+    #[test]
+    fn progress_status_waiting() {
+        let state = progress_state(ProgressPhase::Thinking, 20, 18);
+        assert_eq!(
+            progress_status_line(&state),
+            "⏳ Waiting for agent output... 20s"
+        );
+    }
+
+    #[test]
+    fn progress_status_still_working() {
+        let state = progress_state(ProgressPhase::Thinking, 52, 46);
+        assert_eq!(progress_status_line(&state), "⚠️ Still working... 52s");
+    }
+
+    #[tokio::test]
+    async fn rapid_response_shutdown_does_not_emit_final_thinking_frame() {
+        let progress = std::sync::Arc::new(tokio::sync::Mutex::new(progress_state(
+            ProgressPhase::Thinking,
+            2,
+            2,
+        )));
+        let (tx, mut rx) = watch::channel("…".to_string());
+
+        let first = next_streaming_edit_candidate(&mut rx, &progress)
+            .await
+            .expect("progress frame before output");
+        assert_eq!(first, "⏳ Thinking... 2s");
+
+        tx.send("hi".to_string()).expect("send final content");
+        let second = next_streaming_edit_candidate(&mut rx, &progress)
+            .await
+            .expect("content frame");
+        assert_eq!(second, "hi");
+
+        drop(tx);
+        let third = next_streaming_edit_candidate(&mut rx, &progress).await;
+        assert_eq!(third, None, "closed sender must not emit Thinking again");
+    }
 
     /// Compile-time regression guard: use_streaming() is a required trait method
     /// (no default). Any adapter that forgets to implement it will fail to compile.

@@ -1,4 +1,4 @@
-use crate::acp::connection::AcpConnection;
+use crate::acp::connection::{AcpConnection, AcpWriter};
 use crate::acp::protocol::ConfigOption;
 use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
@@ -14,9 +14,9 @@ use tracing::{info, warn};
 struct PoolState {
     /// Active connections: thread_key → AcpConnection handle.
     active: HashMap<String, Arc<Mutex<AcpConnection>>>,
-    /// Lock-free cancel handles: thread_key → (stdin, session_id).
+    /// Lock-free cancel handles: thread_key → (writer, session_id).
     /// Stored separately so cancel can work without locking the connection.
-    cancel_handles: HashMap<String, (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String)>,
+    cancel_handles: HashMap<String, (AcpWriter, String)>,
     /// Suspended sessions: thread_key → ACP sessionId.
     /// Used at runtime to decide which thread can be resumed via `session/load`
     /// because it no longer has a live in-memory connection.
@@ -115,6 +115,38 @@ impl SessionPool {
         {
             warn!(path = %self.mapping_path.display(), error = %e, "failed to persist thread mapping");
         }
+    }
+
+    fn resolve_working_dir(&self, thread_id: &str) -> Result<String> {
+        let base = PathBuf::from(&self.config.working_dir);
+
+        if !self.config.per_session_working_dir {
+            if self.config.transport == crate::config::AgentTransport::Stdio {
+                anyhow::ensure!(
+                    base.is_dir(),
+                    "agent working_dir does not exist or is not a directory: {}",
+                    base.display()
+                );
+            }
+            return Ok(self.config.working_dir.clone());
+        }
+
+        let resolved = base.join(sanitize_session_dir_component(thread_id));
+        if self.config.transport == crate::config::AgentTransport::Stdio {
+            anyhow::ensure!(
+                base.is_dir(),
+                "agent working_dir does not exist or is not a directory: {}",
+                base.display()
+            );
+            std::fs::create_dir_all(&resolved).map_err(|e| {
+                anyhow!(
+                    "failed to create per-session working_dir {}: {}",
+                    resolved.display(),
+                    e
+                )
+            })?;
+        }
+        Ok(resolved.to_string_lossy().into_owned())
     }
 
     fn save_meta(&self, workdirs: &HashMap<String, String>) {
@@ -226,19 +258,13 @@ impl SessionPool {
         } else if let Some(wd) = working_dir_override {
             wd.to_string()
         } else {
-            self.config.working_dir.clone()
+            self.resolve_working_dir(thread_id)?
         };
 
         // Build the replacement connection outside the state lock so one stuck
         // initialization does not block all unrelated sessions.
-        let mut new_conn = AcpConnection::spawn(
-            &self.config.command,
-            &self.config.args,
-            &effective_workdir,
-            &self.config.env,
-            &self.config.inherit_env,
-        )
-        .await?;
+        let mut new_conn =
+            AcpConnection::spawn(&self.config, &effective_workdir, thread_id).await?;
 
         new_conn.initialize().await?;
 
@@ -272,27 +298,39 @@ impl SessionPool {
         let cancel_session_id = new_conn.acp_session_id.clone().unwrap_or_default();
         let new_conn = Arc::new(Mutex::new(new_conn));
 
-        let mut state = self.state.write().await;
+        let stale_conn = {
+            let mut state = self.state.write().await;
 
-        // Another task may have created a healthy connection while we were
-        // initializing this one.
-        if let Some(existing) = state.active.get(thread_id).cloned() {
-            let Ok(existing) = existing.try_lock() else {
-                return Ok(false);
-            };
-            if existing.alive() {
-                return Ok(false);
+            // Another task may have created a healthy connection while we were
+            // initializing this one.
+            if let Some(existing) = state.active.get(thread_id).cloned() {
+                let Ok(existing) = existing.try_lock() else {
+                    return Ok(false);
+                };
+                if existing.alive() {
+                    return Ok(false);
+                }
+                warn!(thread_id, "stale connection, rebuilding");
+                drop(existing);
+                state.cancel_handles.remove(thread_id);
+                state.active.remove(thread_id)
+            } else {
+                None
             }
-            warn!(thread_id, "stale connection, rebuilding");
-            drop(existing);
-            state.active.remove(thread_id);
-            state.cancel_handles.remove(thread_id);
+        };
+        if let Some(stale_conn) = stale_conn {
+            let mut stale_conn = stale_conn.lock().await;
+            stale_conn.close_transport().await;
         }
 
+        let mut state = self.state.write().await;
+
+        let mut retired = Vec::new();
         if state.active.len() >= self.max_sessions {
             if let Some((key, expected_conn, _, sid)) = eviction_candidate {
                 if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
                     state.cancel_handles.remove(&key);
+                    retired.push(expected_conn);
                     info!(evicted = %key, "pool full, suspending oldest idle session");
                     if let Some(sid) = sid {
                         state.persisted.insert(key.clone(), sid.clone());
@@ -345,6 +383,11 @@ impl SessionPool {
         // A session with prior state (saved_session_id or had_existing) is a resume,
         // even if we had to spawn a new ACP process. ADR §2.2: directives are first-message-only.
         let is_fresh = !had_existing && saved_session_id.is_none();
+        drop(state);
+        for conn in retired {
+            let mut conn = conn.lock().await;
+            conn.close_transport().await;
+        }
         Ok(is_fresh)
     }
 
@@ -408,7 +451,7 @@ impl SessionPool {
     /// Cancel the current in-flight operation for a session.
     /// Uses pre-stored cancel handles to avoid locking the connection (which is held during streaming).
     pub async fn cancel_session(&self, thread_id: &str) -> Result<()> {
-        let (stdin, session_id) = {
+        let (writer, session_id) = {
             let state = self.state.read().await;
             state
                 .cancel_handles
@@ -422,11 +465,7 @@ impl SessionPool {
             "params": {"sessionId": session_id}
         }))?;
         tracing::info!(session_id, "sending session/cancel");
-        use tokio::io::AsyncWriteExt;
-        let mut w = stdin.lock().await;
-        w.write_all(data.as_bytes()).await?;
-        w.write_all(b"\n").await?;
-        w.flush().await?;
+        writer.send_line(&data).await?;
         Ok(())
     }
 
@@ -438,7 +477,7 @@ impl SessionPool {
         // Send session/cancel via the lock-free stdin handle first.
         // This stops in-flight streaming even while with_connection() holds the
         // connection mutex, so the old process finishes promptly.
-        if let Some((stdin, session_id)) = {
+        if let Some((writer, session_id)) = {
             let state = self.state.read().await;
             state.cancel_handles.get(thread_id).cloned()
         } {
@@ -448,15 +487,12 @@ impl SessionPool {
                 "params": {"sessionId": session_id}
             }))?;
             tracing::info!(session_id, "reset: sending session/cancel");
-            use tokio::io::AsyncWriteExt;
-            let mut w = stdin.lock().await;
-            let _ = w.write_all(data.as_bytes()).await;
-            let _ = w.write_all(b"\n").await;
-            let _ = w.flush().await;
+            let _ = writer.send_line(&data).await;
         }
 
         let mut state = self.state.write().await;
-        let had_active = state.active.remove(thread_id).is_some();
+        let removed = state.active.remove(thread_id);
+        let had_active = removed.is_some();
         state.cancel_handles.remove(thread_id);
         state.suspended.remove(thread_id);
         state.persisted.remove(thread_id);
@@ -464,6 +500,11 @@ impl SessionPool {
         state.session_workdirs.remove(thread_id);
         self.save_mapping(&state.persisted);
         self.save_meta(&state.session_workdirs);
+        drop(state);
+        if let Some(conn) = removed {
+            let mut conn = conn.lock().await;
+            conn.close_transport().await;
+        }
         if had_active {
             info!(thread_id, "session reset");
             Ok(())
@@ -472,8 +513,8 @@ impl SessionPool {
         }
     }
 
-    pub async fn cleanup_idle(&self, ttl_secs: u64) {
-        let cutoff = Instant::now() - std::time::Duration::from_secs(ttl_secs);
+    pub async fn cleanup_idle(&self, ttl: std::time::Duration) {
+        let cutoff = Instant::now() - ttl;
 
         let snapshot: Vec<(String, Arc<Mutex<AcpConnection>>)> = {
             let state = self.state.read().await;
@@ -502,10 +543,12 @@ impl SessionPool {
         }
 
         let mut state = self.state.write().await;
+        let mut retired = Vec::new();
         for (key, expected_conn, sid) in stale {
             if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
                 info!(thread_id = %key, "cleaning up idle session");
                 state.cancel_handles.remove(&key);
+                retired.push(expected_conn);
                 if let Some(sid) = sid {
                     state.persisted.insert(key.clone(), sid.clone());
                     state.suspended.insert(key, sid);
@@ -517,6 +560,11 @@ impl SessionPool {
         }
         self.save_mapping(&state.persisted);
         self.save_meta(&state.session_workdirs);
+        drop(state);
+        for conn in retired {
+            let mut conn = conn.lock().await;
+            conn.close_transport().await;
+        }
     }
 
     pub async fn shutdown(&self) {
@@ -533,10 +581,10 @@ impl SessionPool {
         };
 
         let mut session_ids: Vec<(String, String)> = Vec::new();
-        for (key, conn) in snapshot {
+        for (key, conn) in &snapshot {
             let conn = conn.lock().await;
             if let Some(sid) = conn.acp_session_id.clone() {
-                session_ids.push((key, sid));
+                session_ids.push((key.clone(), sid));
             }
         }
 
@@ -549,14 +597,41 @@ impl SessionPool {
         let count = state.active.len();
         state.active.clear();
         state.cancel_handles.clear();
+        drop(state);
+        for (_, conn) in snapshot {
+            let mut conn = conn.lock().await;
+            conn.close_transport().await;
+        }
         info!(count, "pool shutdown complete");
+    }
+}
+
+fn sanitize_session_dir_component(thread_id: &str) -> String {
+    let mut sanitized = String::with_capacity(thread_id.len());
+    for ch in thread_id.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+
+    let trimmed = sanitized.trim_matches('_');
+    if trimmed.is_empty() {
+        "session".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{get_or_insert_gate, remove_if_same_handle};
+    use super::{
+        get_or_insert_gate, remove_if_same_handle, sanitize_session_dir_component, SessionPool,
+    };
+    use crate::config::{AgentConfig, AgentTransport};
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -618,5 +693,142 @@ mod tests {
             roundtrip.get("suspended-thread"),
             Some(&"session-suspended".to_string())
         );
+    }
+
+    #[test]
+    fn sanitize_session_dir_component_replaces_separators() {
+        assert_eq!(
+            sanitize_session_dir_component("discord:1234567890"),
+            "discord_1234567890"
+        );
+        assert_eq!(
+            sanitize_session_dir_component("slack:C0123/U0456"),
+            "slack_C0123_U0456"
+        );
+    }
+
+    #[test]
+    fn resolve_working_dir_uses_base_dir_by_default() {
+        let pool = SessionPool::new(
+            AgentConfig {
+                transport: AgentTransport::Stdio,
+                command: "echo".into(),
+                args: vec![],
+                url: None,
+                headers: HashMap::new(),
+                working_dir: "/tmp/openab-working-dir".into(),
+                per_session_working_dir: false,
+                env: HashMap::new(),
+                inherit_env: vec![],
+            },
+            1,
+        );
+
+        let resolved = pool
+            .resolve_working_dir("discord:123")
+            .expect("resolve default working dir");
+        assert_eq!(resolved, "/tmp/openab-working-dir");
+    }
+
+    #[test]
+    fn resolve_working_dir_creates_per_session_subdirectory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = SessionPool::new(
+            AgentConfig {
+                transport: AgentTransport::Stdio,
+                command: "echo".into(),
+                args: vec![],
+                url: None,
+                headers: HashMap::new(),
+                working_dir: tmp.path().to_string_lossy().into_owned(),
+                per_session_working_dir: true,
+                env: HashMap::new(),
+                inherit_env: vec![],
+            },
+            1,
+        );
+
+        let resolved = pool
+            .resolve_working_dir("discord:123")
+            .expect("resolve per-session working dir");
+        let expected = tmp.path().join("discord_123");
+        assert_eq!(PathBuf::from(&resolved), expected);
+        assert!(expected.is_dir());
+    }
+
+    #[test]
+    fn resolve_working_dir_stdio_requires_existing_base_dir() {
+        let missing = "/tmp/openab-nonexistent-working-dir-stdio";
+        let pool = SessionPool::new(
+            AgentConfig {
+                transport: AgentTransport::Stdio,
+                command: "echo".into(),
+                args: vec![],
+                url: None,
+                headers: HashMap::new(),
+                working_dir: missing.into(),
+                per_session_working_dir: false,
+                env: HashMap::new(),
+                inherit_env: vec![],
+            },
+            1,
+        );
+
+        let err = pool
+            .resolve_working_dir("discord:123")
+            .expect_err("stdio should validate local working_dir");
+        assert!(err.to_string().contains("working_dir does not exist"));
+    }
+
+    #[test]
+    fn resolve_working_dir_websocket_skips_local_validation() {
+        let missing = "/tmp/openab-nonexistent-working-dir-websocket";
+        let pool = SessionPool::new(
+            AgentConfig {
+                transport: AgentTransport::WebSocket,
+                command: String::new(),
+                args: vec![],
+                url: Some("ws://127.0.0.1:3000".into()),
+                headers: HashMap::new(),
+                working_dir: missing.into(),
+                per_session_working_dir: false,
+                env: HashMap::new(),
+                inherit_env: vec![],
+            },
+            1,
+        );
+
+        let resolved = pool
+            .resolve_working_dir("discord:123")
+            .expect("websocket should not validate local working_dir");
+        assert_eq!(resolved, missing);
+    }
+
+    #[test]
+    fn resolve_working_dir_websocket_does_not_create_per_session_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing_base = tmp.path().join("remote-only-base");
+        let expected = missing_base.join("discord_123");
+        let pool = SessionPool::new(
+            AgentConfig {
+                transport: AgentTransport::WebSocket,
+                command: String::new(),
+                args: vec![],
+                url: Some("ws://127.0.0.1:3000".into()),
+                headers: HashMap::new(),
+                working_dir: missing_base.to_string_lossy().into_owned(),
+                per_session_working_dir: true,
+                env: HashMap::new(),
+                inherit_env: vec![],
+            },
+            1,
+        );
+
+        let resolved = pool
+            .resolve_working_dir("discord:123")
+            .expect("websocket should only derive the per-session cwd string");
+        assert_eq!(PathBuf::from(&resolved), expected);
+        assert!(!expected.exists());
+        assert!(!missing_base.exists());
     }
 }

@@ -475,9 +475,13 @@ fn default_gateway_platform() -> String {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 struct AgentConfigRaw {
+    transport: AgentTransport,
     command: Option<String>,
     args: Option<Vec<String>>,
+    url: Option<String>,
+    headers: HashMap<String, String>,
     working_dir: String,
+    per_session_working_dir: bool,
     env: HashMap<String, String>,
     inherit_env: Vec<String>,
 }
@@ -485,9 +489,13 @@ struct AgentConfigRaw {
 impl Default for AgentConfigRaw {
     fn default() -> Self {
         Self {
+            transport: AgentTransport::default(),
             command: None,
             args: None,
+            url: None,
+            headers: HashMap::new(),
             working_dir: default_working_dir(),
+            per_session_working_dir: false,
             env: HashMap::new(),
             inherit_env: Vec::new(),
         }
@@ -496,9 +504,13 @@ impl Default for AgentConfigRaw {
 
 #[derive(Debug)]
 pub struct AgentConfig {
+    pub transport: AgentTransport,
     pub command: String,
     pub args: Vec<String>,
+    pub url: Option<String>,
+    pub headers: HashMap<String, String>,
     pub working_dir: String,
+    pub per_session_working_dir: bool,
     pub env: HashMap<String, String>,
     pub inherit_env: Vec<String>,
     /// Whether the command was explicitly set in config (vs defaulted from env/fallback).
@@ -508,9 +520,13 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
+            transport: AgentTransport::default(),
             command: default_agent_command(),
             args: default_agent_args(),
+            url: None,
+            headers: HashMap::new(),
             working_dir: default_working_dir(),
+            per_session_working_dir: false,
             env: HashMap::new(),
             inherit_env: Vec::new(),
             command_explicit: false,
@@ -534,13 +550,38 @@ impl<'de> serde::Deserialize<'de> for AgentConfig {
             (false, None) => default_agent_args(), // neither set → env var
         };
         Ok(AgentConfig {
+            transport: raw.transport,
             command,
             args,
+            url: raw.url,
+            headers: raw.headers,
             working_dir: raw.working_dir,
+            per_session_working_dir: raw.per_session_working_dir,
             env: raw.env,
             inherit_env: raw.inherit_env,
             command_explicit: cmd_explicit,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentTransport {
+    #[default]
+    Stdio,
+    WebSocket,
+}
+
+impl<'de> Deserialize<'de> for AgentTransport {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().replace('-', "_").as_str() {
+            "stdio" => Ok(Self::Stdio),
+            "websocket" | "ws" => Ok(Self::WebSocket),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["stdio", "websocket"],
+            )),
+        }
     }
 }
 
@@ -549,7 +590,7 @@ pub struct PoolConfig {
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
     #[serde(default = "default_ttl_hours")]
-    pub session_ttl_hours: u64,
+    pub session_ttl_hours: f64,
     /// Hard ceiling for a single prompt (#732). Once exceeded, the broker
     /// abandons the in-flight request, sends `session/cancel` to the agent,
     /// and clears the pending entry so late responses cannot leak into the
@@ -715,8 +756,8 @@ fn default_agent_args() -> Vec<String> {
 fn default_max_sessions() -> usize {
     10
 }
-fn default_ttl_hours() -> u64 {
-    4
+fn default_ttl_hours() -> f64 {
+    4.0
 }
 pub(crate) fn default_prompt_hard_timeout_secs() -> u64 {
     30 * 60
@@ -937,7 +978,7 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
             ac.runtime_arn
         );
 
-        if !config.agent.command_explicit {
+        if !config.agent.command_explicit && config.agent.transport == AgentTransport::Stdio {
             // Use native Rust bridge (agentcore feature) or fall back to Python adapter
             #[cfg(feature = "agentcore")]
             let (cmd, args) = {
@@ -973,13 +1014,36 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
                 ],
             );
             config.agent = AgentConfig {
+                transport: config.agent.transport,
                 command: cmd,
                 args,
+                url: config.agent.url.clone(),
+                headers: config.agent.headers.clone(),
                 working_dir: config.agent.working_dir.clone(),
+                per_session_working_dir: config.agent.per_session_working_dir,
                 env: config.agent.env.clone(),
                 inherit_env: config.agent.inherit_env.clone(),
                 command_explicit: true, // synthesized counts as explicit
             };
+        }
+    }
+
+    match config.agent.transport {
+        AgentTransport::Stdio => {
+            anyhow::ensure!(
+                !config.agent.command.trim().is_empty(),
+                "agent.command is required when agent.transport = \"stdio\""
+            );
+        }
+        AgentTransport::WebSocket => {
+            anyhow::ensure!(
+                config
+                    .agent
+                    .url
+                    .as_deref()
+                    .is_some_and(|url| !url.trim().is_empty()),
+                "agent.url is required when agent.transport = \"websocket\""
+            );
         }
     }
 
@@ -1017,6 +1081,10 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
         config.pool.liveness_check_secs > 0,
         "pool.liveness_check_secs must be > 0 (zero would spin the recv loop)"
     );
+    anyhow::ensure!(
+        config.pool.session_ttl_hours > 0.0,
+        "pool.session_ttl_hours must be > 0"
+    );
 
     Ok(config)
 }
@@ -1039,8 +1107,104 @@ command = "echo"
         let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
         assert_eq!(cfg.discord.unwrap().bot_token, "test-token");
         assert_eq!(cfg.agent.command, "echo");
+        assert_eq!(cfg.agent.transport, AgentTransport::Stdio);
+        assert!(!cfg.agent.per_session_working_dir);
         assert_eq!(cfg.pool.max_sessions, 10);
+        assert_eq!(cfg.pool.session_ttl_hours, 4.0);
         assert!(cfg.reactions.enabled);
+    }
+
+    #[test]
+    fn parse_fractional_session_ttl_hours() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[pool]
+session_ttl_hours = 0.5
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(cfg.pool.session_ttl_hours, 0.5);
+    }
+
+    #[test]
+    fn reject_non_positive_session_ttl_hours() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[pool]
+session_ttl_hours = 0
+
+[agent]
+command = "echo"
+"#;
+        let err = parse_config(toml, "test").unwrap_err().to_string();
+        assert!(err.contains("pool.session_ttl_hours must be > 0"));
+    }
+
+    #[test]
+    fn parse_agent_per_session_working_dir() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+per_session_working_dir = true
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(cfg.agent.per_session_working_dir);
+    }
+
+    #[test]
+    fn parse_websocket_agent_config() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+transport = "websocket"
+url = "ws://127.0.0.1:3000"
+headers = { Authorization = "Bearer token" }
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(cfg.agent.transport, AgentTransport::WebSocket);
+        assert_eq!(cfg.agent.url.as_deref(), Some("ws://127.0.0.1:3000"));
+        assert_eq!(
+            cfg.agent.headers.get("Authorization").map(String::as_str),
+            Some("Bearer token")
+        );
+        assert!(cfg.agent.command.is_empty());
+    }
+
+    #[test]
+    fn websocket_agent_requires_url() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+transport = "websocket"
+"#;
+        let err = parse_config(toml, "test").unwrap_err().to_string();
+        assert!(err.contains("agent.url is required"));
+    }
+
+    #[test]
+    fn stdio_agent_requires_command() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+transport = "stdio"
+"#;
+        let err = parse_config(toml, "test").unwrap_err().to_string();
+        assert!(err.contains("agent.command is required"));
     }
 
     #[test]

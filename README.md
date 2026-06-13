@@ -69,6 +69,9 @@ Before running openab, enable these in the [Discord Developer Portal](https://di
 
 See [docs/discord.md](docs/discord.md) for a detailed step-by-step guide.
 
+Discord outbound connections also respect standard process proxy variables:
+`http_proxy`, `https_proxy`, and `no_proxy` (uppercase variants supported).
+
 ### 1. Create a Bot
 
 <details>
@@ -216,6 +219,13 @@ allowed_channels = ["C0123456789"]   # channel ID allowlist (empty = allow all)
 # allowed_users = ["U0123456789"]    # user ID allowlist (empty = allow all)
 
 [agent]
+transport = "stdio"                  # "stdio" (default) or "websocket"
+command = "kiro-cli"                  # CLI command
+args = ["acp", "--trust-all-tools"]   # ACP mode args
+# url = "ws://stdio-to-ws:3000"       # required for websocket transport
+# headers = { Authorization = "Bearer ${ACP_TOKEN}" } # optional for websocket transport
+working_dir = "/tmp"                  # agent working directory
+env = {}                              # extra env vars passed to the agent
 # command, args, and working_dir default from OPENAB_AGENT_COMMAND and $HOME
 # env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
 

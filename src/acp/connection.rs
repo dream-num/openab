@@ -1,16 +1,23 @@
 use crate::acp::protocol::{
     parse_config_options, ConfigOption, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
 };
+use crate::config::{AgentConfig, AgentTransport};
 use anyhow::{anyhow, Result};
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, trace};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tracing::{debug, error, info, trace, warn};
 
 /// Pick the most permissive selectable permission option from ACP options.
 fn pick_best_option(options: &[Value]) -> Option<String> {
@@ -107,11 +114,46 @@ impl ContentBlock {
     }
 }
 
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type WsWriter = futures_util::stream::SplitSink<WsStream, Message>;
+type WsReader = futures_util::stream::SplitStream<WsStream>;
+
+#[derive(Clone)]
+pub enum AcpWriter {
+    Stdio(Arc<Mutex<ChildStdin>>),
+    WebSocket(Arc<Mutex<WsWriter>>),
+}
+
+impl AcpWriter {
+    pub async fn send_line(&self, data: &str) -> Result<()> {
+        match self {
+            Self::Stdio(stdin) => {
+                let mut w = stdin.lock().await;
+                w.write_all(data.as_bytes()).await?;
+                w.write_all(b"\n").await?;
+                w.flush().await?;
+            }
+            Self::WebSocket(ws) => {
+                let mut w = ws.lock().await;
+                w.send(Message::Text(format!("{data}\n"))).await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn close(&self) {
+        if let Self::WebSocket(ws) = self {
+            let mut w = ws.lock().await;
+            let _ = w.send(Message::Close(None)).await;
+        }
+    }
+}
+
 pub struct AcpConnection {
-    _proc: Child,
+    _proc: Option<Child>,
     /// PID of the direct child, used as the process group ID for cleanup.
     child_pgid: Option<i32>,
-    stdin: Arc<Mutex<ChildStdin>>,
+    writer: AcpWriter,
     next_id: AtomicU64,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
     notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
@@ -150,6 +192,109 @@ fn build_agent_env(
     (result, inherited)
 }
 
+fn websocket_client_id(thread_key: &str) -> &str {
+    thread_key.rsplit(':').next().unwrap_or(thread_key)
+}
+
+async fn finish_reader_loop(
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
+    notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
+) {
+    let mut map = pending.lock().await;
+    for (_, tx) in map.drain() {
+        let _ = tx.send(JsonRpcMessage {
+            id: None,
+            method: None,
+            result: None,
+            error: Some(crate::acp::protocol::JsonRpcError {
+                code: -1,
+                message: "connection closed".into(),
+                data: None,
+            }),
+            params: None,
+        });
+    }
+    let mut sub = notify_tx.lock().await;
+    *sub = None;
+}
+
+async fn handle_incoming_message(
+    msg: JsonRpcMessage,
+    writer: &AcpWriter,
+    pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
+    notify_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
+) {
+    if msg.method.as_deref() == Some("session/request_permission") {
+        if let Some(id) = msg.id {
+            let title = msg
+                .params
+                .as_ref()
+                .and_then(|p| p.get("toolCall"))
+                .and_then(|t| t.get("title"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("?");
+
+            let outcome = build_permission_response(msg.params.as_ref());
+            info!(title, %outcome, "auto-respond permission");
+            let reply = JsonRpcResponse::new(id, outcome);
+            if let Ok(data) = serde_json::to_string(&reply) {
+                let _ = writer.send_line(&data).await;
+            }
+        }
+        return;
+    }
+
+    if let Some(id) = msg.id {
+        let mut map = pending.lock().await;
+        if let Some(tx) = map.remove(&id) {
+            let sub = notify_tx.lock().await;
+            if let Some(ntx) = sub.as_ref() {
+                let _ = ntx.send(JsonRpcMessage {
+                    id: Some(id),
+                    method: None,
+                    result: msg.result.clone(),
+                    error: msg.error.clone(),
+                    params: None,
+                });
+            }
+            let _ = tx.send(msg);
+            return;
+        }
+        trace!(request_id = id, "stale id-bearing message after abandon");
+    }
+
+    let sub = notify_tx.lock().await;
+    if let Some(tx) = sub.as_ref() {
+        let _ = tx.send(msg);
+    }
+}
+
+async fn handle_ws_value(
+    value: Value,
+    writer: &AcpWriter,
+    pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
+    notify_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
+) {
+    if value.get("type").and_then(|v| v.as_str()) == Some("connected") {
+        debug!(payload = %value, "ignoring stdio-to-ws connected envelope");
+        return;
+    }
+    if value.get("type").and_then(|v| v.as_str()) == Some("reconnect") {
+        debug!(payload = %value, "ignoring stdio-to-ws reconnect envelope");
+        return;
+    }
+
+    match serde_json::from_value::<JsonRpcMessage>(value.clone()) {
+        Ok(msg) => {
+            debug!(payload = %value, "acp_recv");
+            handle_incoming_message(msg, writer, pending, notify_tx).await;
+        }
+        Err(e) => {
+            warn!(payload = %value, error = %e, "ignoring non-ACP websocket payload");
+        }
+    }
+}
+
 /// Reader loop body: reads JSON-RPC messages from `reader`, auto-replies
 /// `session/request_permission` via `writer`, resolves pending responses,
 /// and forwards notifications + stale id-bearing messages to the active
@@ -182,7 +327,6 @@ pub(crate) async fn run_reader_loop<R, W>(
         };
         debug!(line = line.trim(), "acp_recv");
 
-        // Auto-reply session/request_permission
         if msg.method.as_deref() == Some("session/request_permission") {
             if let Some(id) = msg.id {
                 let title = msg
@@ -205,14 +349,11 @@ pub(crate) async fn run_reader_loop<R, W>(
             continue;
         }
 
-        // Response (has id) → resolve pending AND forward to subscriber
         if let Some(id) = msg.id {
             let mut map = pending.lock().await;
             if let Some(tx) = map.remove(&id) {
-                // Forward to subscriber so they see the completion
                 let sub = notify_tx.lock().await;
                 if let Some(ntx) = sub.as_ref() {
-                    // Clone the essential fields for the subscriber
                     let _ = ntx.send(JsonRpcMessage {
                         id: Some(id),
                         method: None,
@@ -224,196 +365,301 @@ pub(crate) async fn run_reader_loop<R, W>(
                 let _ = tx.send(msg);
                 continue;
             }
-            // Stale id (#732): pending was already abandoned. Falls through
-            // to subscriber forwarding; the adapter recv loop filters by
-            // request_id so it can't leak into the next prompt.
             trace!(request_id = id, "stale id-bearing message after abandon");
         }
 
-        // Notification → forward to subscriber
         let sub = notify_tx.lock().await;
         if let Some(tx) = sub.as_ref() {
             let _ = tx.send(msg);
         }
     }
 
-    // Connection closed — resolve all pending with error
-    let mut map = pending.lock().await;
-    for (_, tx) in map.drain() {
-        let _ = tx.send(JsonRpcMessage {
-            id: None,
-            method: None,
-            result: None,
-            error: Some(crate::acp::protocol::JsonRpcError {
-                code: -1,
-                message: "connection closed".into(),
-                data: None,
-            }),
-            params: None,
-        });
+    finish_reader_loop(pending, notify_tx).await;
+}
+
+async fn run_ws_reader_loop(
+    mut reader: WsReader,
+    writer: AcpWriter,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
+    notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
+) {
+    let mut buf = String::new();
+
+    while let Some(frame) = reader.next().await {
+        let chunk = match frame {
+            Ok(Message::Text(text)) => text.to_string(),
+            Ok(Message::Binary(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
+            Ok(Message::Close(_)) => break,
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
+            Ok(Message::Frame(_)) => continue,
+            Err(e) => {
+                error!("websocket reader error: {e}");
+                break;
+            }
+        };
+
+        buf.push_str(&chunk);
+        loop {
+            let mut stream = serde_json::Deserializer::from_str(&buf).into_iter::<Value>();
+            let mut consumed = 0usize;
+            let mut progressed = false;
+
+            while let Some(item) = stream.next() {
+                match item {
+                    Ok(value) => {
+                        consumed = stream.byte_offset();
+                        progressed = true;
+                        handle_ws_value(value, &writer, &pending, &notify_tx).await;
+                    }
+                    Err(e) if e.is_eof() => break,
+                    Err(e) => {
+                        consumed = stream.byte_offset();
+                        warn!(buffer = %buf, error = %e, "dropping malformed websocket payload");
+                        if consumed == 0 {
+                            buf.clear();
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if consumed > 0 {
+                buf.drain(..consumed);
+            }
+
+            if !progressed {
+                break;
+            }
+        }
     }
-    // Close the notify channel so rx.recv() returns None
-    let mut sub = notify_tx.lock().await;
-    *sub = None;
+
+    let trailing = buf.trim();
+    if !trailing.is_empty() {
+        if let Ok(value) = serde_json::from_str::<Value>(trailing) {
+            handle_ws_value(value, &writer, &pending, &notify_tx).await;
+        }
+    }
+
+    finish_reader_loop(pending, notify_tx).await;
 }
 
 impl AcpConnection {
-    pub async fn spawn(
-        command: &str,
-        args: &[String],
-        working_dir: &str,
-        env: &std::collections::HashMap<String, String>,
-        inherit_env: &[String],
-    ) -> Result<Self> {
-        info!(cmd = command, ?args, cwd = working_dir, "spawning agent");
-
-        let mut cmd = tokio::process::Command::new(command);
-        cmd.args(args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .current_dir(working_dir);
-        // Create a new process group so we can kill the entire tree.
-        // SAFETY: setpgid is async-signal-safe (POSIX.1-2008) and called
-        // before exec. Return value checked — failure means the child won't
-        // have its own process group, so kill(-pgid) would be unsafe.
-        #[cfg(unix)]
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setpgid(0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        #[cfg(windows)]
-        {
-            cmd.creation_flags(0x00000200); // CREATE_NEW_PROCESS_GROUP
-        }
-        // Clear inherited env to prevent credential leakage (e.g. DISCORD_BOT_TOKEN).
-        // Only [agent].env values + essential baseline vars are passed through.
-        cmd.env_clear();
-        // Preserve the real HOME so agents can find OAuth/auth files (~/.codex,
-        // ~/.claude, ~/.config/gh, etc.). working_dir is already set via
-        // current_dir() above and is not necessarily the user's home directory.
-        cmd.env(
-            "HOME",
-            std::env::var("HOME").unwrap_or_else(|_| working_dir.into()),
-        );
-        cmd.env(
-            "PATH",
-            std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into()),
-        );
-        #[cfg(unix)]
-        {
-            cmd.env(
-                "USER",
-                std::env::var("USER").unwrap_or_else(|_| "agent".into()),
-            );
-        }
-        #[cfg(windows)]
-        {
-            // Windows requires SystemRoot for DLL loading and basic OS functionality.
-            // USERPROFILE is the Windows equivalent of HOME.
-            cmd.env(
-                "USERPROFILE",
-                std::env::var("USERPROFILE").unwrap_or_else(|_| working_dir.into()),
-            );
-            cmd.env(
-                "USERNAME",
-                std::env::var("USERNAME").unwrap_or_else(|_| "agent".into()),
-            );
-            if let Ok(v) = std::env::var("SystemRoot") {
-                cmd.env("SystemRoot", v);
-            }
-            if let Ok(v) = std::env::var("SystemDrive") {
-                cmd.env("SystemDrive", v);
-            }
-        }
-        for (k, v) in env {
-            cmd.env(k, expand_env(v));
-        }
-        // Inherit selected env vars from the OAB process (e.g. vars injected
-        // via Kubernetes envFrom).  Keys already in [agent].env are skipped —
-        // explicit values take precedence.
-        let (agent_env, inherited_keys) = build_agent_env(env, inherit_env);
-        for (k, v) in &agent_env {
-            cmd.env(k, v);
-        }
-        if !agent_env.is_empty() {
-            let explicit_keys: Vec<&String> = env.keys().collect();
-            tracing::warn!(
-                ?explicit_keys,
-                ?inherited_keys,
-                "[agent].env/inherit_env is set -- these values are accessible to the agent and could be exfiltrated via prompt injection"
-            );
-        }
-        let mut proc = cmd
-            .spawn()
-            .map_err(|e| anyhow!("failed to spawn {command}: {e}"))?;
-        let child_pgid = proc.id().and_then(|pid| i32::try_from(pid).ok());
-
-        let stdout = proc.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
-        let stdin = proc.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
-        let stdin = Arc::new(Mutex::new(stdin));
-
-        // Capture agent stderr and log it (ACP spec: agents MAY write to stderr
-        // for logging; clients MAY capture or ignore it).
-        let stderr_handle = if let Some(stderr) = proc.stderr.take() {
-            let cmd_name = command.to_string();
-            Some(tokio::spawn(async move {
-                let mut reader = BufReader::new(stderr);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            let trimmed = line.trim();
-                            if !trimmed.is_empty() {
-                                let sanitized: String = trimmed.chars()
-                                    .filter(|c| !c.is_control() || *c == '\t')
-                                    .collect();
-                                if !sanitized.is_empty() {
-                                    tracing::warn!(agent = %cmd_name, "{sanitized}");
-                                }
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-            }))
-        } else {
-            None
-        };
-
+    pub async fn spawn(config: &AgentConfig, working_dir: &str, thread_key: &str) -> Result<Self> {
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(None));
 
-        let reader_handle = tokio::spawn(run_reader_loop(
-            stdout,
-            stdin.clone(),
-            pending.clone(),
-            notify_tx.clone(),
-        ));
+        match config.transport {
+            AgentTransport::Stdio => {
+                let command = config.command.as_str();
+                let args = &config.args;
+                let env = &config.env;
+                let inherit_env = &config.inherit_env;
+                info!(
+                    transport = "stdio",
+                    cmd = command,
+                    ?args,
+                    cwd = working_dir,
+                    "spawning agent"
+                );
 
-        Ok(Self {
-            _proc: proc,
-            child_pgid,
-            stdin,
-            next_id: AtomicU64::new(1),
-            pending,
-            notify_tx,
-            acp_session_id: None,
-            supports_load_session: false,
-            config_options: Vec::new(),
-            last_active: Instant::now(),
-            session_reset: false,
-            _reader_handle: reader_handle,
-            _stderr_handle: stderr_handle,
-        })
+                let mut cmd = tokio::process::Command::new(command);
+                cmd.args(args)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .current_dir(working_dir);
+                // Create a new process group so we can kill the entire tree.
+                // SAFETY: setpgid is async-signal-safe (POSIX.1-2008) and called
+                // before exec. Return value checked — failure means the child won't
+                // have its own process group, so kill(-pgid) would be unsafe.
+                #[cfg(unix)]
+                unsafe {
+                    cmd.pre_exec(|| {
+                        if libc::setpgid(0, 0) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                #[cfg(windows)]
+                {
+                    cmd.creation_flags(0x00000200); // CREATE_NEW_PROCESS_GROUP
+                }
+                // Clear inherited env to prevent credential leakage (e.g. DISCORD_BOT_TOKEN).
+                // Only [agent].env values + essential baseline vars are passed through.
+                cmd.env_clear();
+                // Preserve the real HOME so agents can find OAuth/auth files (~/.codex,
+                // ~/.claude, ~/.config/gh, etc.). working_dir is already set via
+                // current_dir() above and is not necessarily the user's home directory.
+                cmd.env(
+                    "HOME",
+                    std::env::var("HOME").unwrap_or_else(|_| working_dir.into()),
+                );
+                cmd.env(
+                    "PATH",
+                    std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into()),
+                );
+                #[cfg(unix)]
+                {
+                    cmd.env(
+                        "USER",
+                        std::env::var("USER").unwrap_or_else(|_| "agent".into()),
+                    );
+                }
+                #[cfg(windows)]
+                {
+                    // Windows requires SystemRoot for DLL loading and basic OS functionality.
+                    // USERPROFILE is the Windows equivalent of HOME.
+                    cmd.env(
+                        "USERPROFILE",
+                        std::env::var("USERPROFILE").unwrap_or_else(|_| working_dir.into()),
+                    );
+                    cmd.env(
+                        "USERNAME",
+                        std::env::var("USERNAME").unwrap_or_else(|_| "agent".into()),
+                    );
+                    if let Ok(v) = std::env::var("SystemRoot") {
+                        cmd.env("SystemRoot", v);
+                    }
+                    if let Ok(v) = std::env::var("SystemDrive") {
+                        cmd.env("SystemDrive", v);
+                    }
+                }
+                for (k, v) in env {
+                    cmd.env(k, expand_env(v));
+                }
+                // Inherit selected env vars from the OAB process (e.g. vars injected
+                // via Kubernetes envFrom).  Keys already in [agent].env are skipped —
+                // explicit values take precedence.
+                let (agent_env, inherited_keys) = build_agent_env(env, inherit_env);
+                for (k, v) in &agent_env {
+                    cmd.env(k, v);
+                }
+                if !agent_env.is_empty() {
+                    let explicit_keys: Vec<&String> = env.keys().collect();
+                    tracing::warn!(
+                ?explicit_keys,
+                ?inherited_keys,
+                "[agent].env/inherit_env is set -- these values are accessible to the agent and could be exfiltrated via prompt injection"
+            );
+                }
+                let mut proc = cmd
+                    .spawn()
+                    .map_err(|e| anyhow!("failed to spawn {command}: {e}"))?;
+                let child_pgid = proc.id().and_then(|pid| i32::try_from(pid).ok());
+
+                let stdout = proc.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
+                let stdin = proc.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
+                let stdin = Arc::new(Mutex::new(stdin));
+
+                // Capture agent stderr and log it (ACP spec: agents MAY write to stderr
+                // for logging; clients MAY capture or ignore it).
+                let stderr_handle = if let Some(stderr) = proc.stderr.take() {
+                    let cmd_name = command.to_string();
+                    Some(tokio::spawn(async move {
+                        let mut reader = BufReader::new(stderr);
+                        let mut line = String::new();
+                        loop {
+                            line.clear();
+                            match reader.read_line(&mut line).await {
+                                Ok(0) => break,
+                                Ok(_) => {
+                                    let trimmed = line.trim();
+                                    if !trimmed.is_empty() {
+                                        let sanitized: String = trimmed
+                                            .chars()
+                                            .filter(|c| !c.is_control() || *c == '\t')
+                                            .collect();
+                                        if !sanitized.is_empty() {
+                                            tracing::warn!(agent = %cmd_name, "{sanitized}");
+                                        }
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }))
+                } else {
+                    None
+                };
+
+                let reader_handle = tokio::spawn(run_reader_loop(
+                    stdout,
+                    stdin.clone(),
+                    pending.clone(),
+                    notify_tx.clone(),
+                ));
+
+                Ok(Self {
+                    _proc: Some(proc),
+                    child_pgid,
+                    writer: AcpWriter::Stdio(stdin),
+                    next_id: AtomicU64::new(1),
+                    pending,
+                    notify_tx,
+                    acp_session_id: None,
+                    supports_load_session: false,
+                    config_options: Vec::new(),
+                    last_active: Instant::now(),
+                    session_reset: false,
+                    _reader_handle: reader_handle,
+                    _stderr_handle: stderr_handle,
+                })
+            }
+            AgentTransport::WebSocket => {
+                let url = config
+                    .url
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("agent.url is required for websocket transport"))?;
+                info!(
+                    transport = "websocket",
+                    url,
+                    cwd = working_dir,
+                    "connecting to agent"
+                );
+
+                let mut request = url.into_client_request()?;
+                request.headers_mut().insert(
+                    HeaderName::from_static("x-client-id"),
+                    HeaderValue::from_str(websocket_client_id(thread_key))?,
+                );
+                for (key, value) in &config.headers {
+                    let name = HeaderName::from_bytes(key.as_bytes())?;
+                    let value = HeaderValue::from_str(value)?;
+                    request.headers_mut().insert(name, value);
+                }
+
+                let (stream, _response) = connect_async(request)
+                    .await
+                    .map_err(|e| anyhow!("failed to connect websocket agent {url}: {e}"))?;
+                let (ws_writer, ws_reader) = stream.split();
+                let writer = AcpWriter::WebSocket(Arc::new(Mutex::new(ws_writer)));
+                let reader_handle = tokio::spawn(run_ws_reader_loop(
+                    ws_reader,
+                    writer.clone(),
+                    pending.clone(),
+                    notify_tx.clone(),
+                ));
+
+                Ok(Self {
+                    _proc: None,
+                    child_pgid: None,
+                    writer,
+                    next_id: AtomicU64::new(1),
+                    pending,
+                    notify_tx,
+                    acp_session_id: None,
+                    supports_load_session: false,
+                    config_options: Vec::new(),
+                    last_active: Instant::now(),
+                    session_reset: false,
+                    _reader_handle: reader_handle,
+                    _stderr_handle: None,
+                })
+            }
+        }
     }
 
     fn next_id(&self) -> u64 {
@@ -422,11 +668,7 @@ impl AcpConnection {
 
     pub(crate) async fn send_raw(&self, data: &str) -> Result<()> {
         debug!(data = data.trim(), "acp_send");
-        let mut w = self.stdin.lock().await;
-        w.write_all(data.as_bytes()).await?;
-        w.write_all(b"\n").await?;
-        w.flush().await?;
-        Ok(())
+        self.writer.send_line(data).await
     }
 
     async fn send_request(&self, method: &str, params: Option<Value>) -> Result<JsonRpcMessage> {
@@ -611,8 +853,8 @@ impl AcpConnection {
 
     /// Drop the pending entry for `request_id` and best-effort send
     /// `session/cancel` as a JSON-RPC notification (no id; per ACP spec the
-    /// agent does not reply). Errors are swallowed: the agent process may
-    /// already be dead, in which case the stdin write fails harmlessly.
+    /// agent does not reply). Errors are swallowed: the transport may
+    /// already be dead, in which case the write fails harmlessly.
     /// See #732.
     pub async fn abandon_request(&self, request_id: u64) {
         self.pending.lock().await.remove(&request_id);
@@ -629,13 +871,22 @@ impl AcpConnection {
         }
     }
 
-    /// Return a clone of the stdin handle for lock-free cancel.
-    pub fn cancel_handle(&self) -> Arc<Mutex<ChildStdin>> {
-        Arc::clone(&self.stdin)
+    /// Return a clone of the writer handle for lock-free cancel.
+    pub fn cancel_handle(&self) -> AcpWriter {
+        self.writer.clone()
     }
 
     pub fn alive(&self) -> bool {
         !self._reader_handle.is_finished()
+    }
+
+    pub async fn close_transport(&mut self) {
+        self.writer.close().await;
+        self._reader_handle.abort();
+        if let Some(handle) = self._stderr_handle.take() {
+            handle.abort();
+        }
+        finish_reader_loop(self.pending.clone(), self.notify_tx.clone()).await;
     }
 
     /// Resume a previous session by ID. Returns Ok(()) if the agent accepted
@@ -690,6 +941,7 @@ impl AcpConnection {
 
 impl Drop for AcpConnection {
     fn drop(&mut self) {
+        self._reader_handle.abort();
         if let Some(handle) = self._stderr_handle.take() {
             handle.abort();
         }
@@ -872,13 +1124,10 @@ mod reader_loop_tests {
         agent_stdout_writer.write_all(stale).await.unwrap();
         agent_stdout_writer.flush().await.unwrap();
 
-        let forwarded = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            sub_rx.recv(),
-        )
-        .await
-        .expect("subscriber should receive stale message before timeout")
-        .expect("subscriber channel should not be closed");
+        let forwarded = tokio::time::timeout(std::time::Duration::from_secs(2), sub_rx.recv())
+            .await
+            .expect("subscriber should receive stale message before timeout")
+            .expect("subscriber channel should not be closed");
         assert_eq!(forwarded.id, Some(42));
         assert!(pending.lock().await.is_empty());
 

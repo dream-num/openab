@@ -167,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
     let shutdown_hook = cfg.hooks.pre_shutdown.clone();
 
     let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions));
-    let ttl_secs = cfg.pool.session_ttl_hours * 3600;
+    let ttl = std::time::Duration::from_secs_f64(cfg.pool.session_ttl_hours * 3600.0);
 
     // Resolve STT config (auto-detect GROQ_API_KEY from env)
     if cfg.stt.enabled {
@@ -217,7 +217,7 @@ async fn main() -> anyhow::Result<()> {
     let cleanup_handle = tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            cleanup_pool.cleanup_idle(ttl_secs).await;
+            cleanup_pool.cleanup_idle(ttl).await;
             // Sweep stale per-thread dispatcher entries (idle-exited consumers).
             for d in cleanup_dispatchers.lock().unwrap().iter() {
                 d.sweep_stale();
@@ -231,7 +231,7 @@ async fn main() -> anyhow::Result<()> {
             let http = Arc::new(serenity::http::Http::new(&dc.bot_token));
             Arc::new(discord::DiscordAdapter::new(http)) as Arc<dyn adapter::ChatAdapter>
         });
-    let session_ttl_dur = std::time::Duration::from_secs(ttl_secs);
+    let session_ttl_dur = ttl;
     let shared_slack_adapter: Option<Arc<slack::SlackAdapter>> = cfg.slack.as_ref().map(|s| {
         Arc::new(slack::SlackAdapter::new(
             s.bot_token.clone(),
@@ -478,7 +478,7 @@ async fn main() -> anyhow::Result<()> {
             allowed_role_ids,
             participated_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             multibot_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-            session_ttl: std::time::Duration::from_secs(ttl_secs),
+            session_ttl: ttl,
             max_bot_turns: discord_cfg.max_bot_turns,
             bot_turns: tokio::sync::Mutex::new(bot_turns::BotTurnTracker::new(
                 discord_cfg.max_bot_turns,

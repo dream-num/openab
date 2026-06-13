@@ -102,9 +102,13 @@ The AI agent subprocess that OpenAB spawns to handle messages via ACP.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `command` | string | from `$OPENAB_AGENT_COMMAND` or `"openab-agent"` | Agent binary. Optional — defaults from image env var. |
+| `transport` | string | `"stdio"` | ACP transport: `"stdio"` (spawn a local subprocess) or `"websocket"` (connect to an ACP WebSocket endpoint). |
+| `command` | string | from `$OPENAB_AGENT_COMMAND` or `"openab-agent"` | Agent binary for `transport = "stdio"`; optional unless you want to override the image default. |
 | `args` | string[] | from `$OPENAB_AGENT_COMMAND` or `[]` | CLI arguments. Defaults to env var args only when `command` is also defaulted. |
+| `url` | string | — | WebSocket URL for `transport = "websocket"` (e.g. `ws://stdio-to-ws:3000`). Required for websocket transport. |
+| `headers` | map | `{}` | Extra HTTP headers sent during the WebSocket handshake. Only used for websocket transport. |
 | `working_dir` | string | `$HOME` | Working directory for the agent process. Optional — defaults to container's `$HOME`. |
+| `per_session_working_dir` | bool | `false` | When `true`, OpenAB creates a stable per-session subdirectory under `working_dir` and uses that as the agent cwd. Discord threads become paths like `working_dir/discord_<thread_id>`. |
 | `env` | map | `{}` | Extra environment variables (e.g. `{ OPENAI_API_KEY = "${OPENAI_API_KEY}" }`). |
 | `inherit_env` | string[] | `[]` | Env var names to inherit from the OAB process (e.g. vars injected via K8s `envFrom`). Keys in `env` take precedence. |
 
@@ -128,6 +132,7 @@ This works for all agents regardless of backend — no need to remember the spec
 command = "kiro-cli"
 args = ["acp", "--trust-all-tools"]
 working_dir = "/home/agent"
+# per_session_working_dir = true
 
 # Claude Code
 [agent]
@@ -177,6 +182,13 @@ working_dir = "/home/agent"
 [agent]
 command = "hermes-acp"
 working_dir = "/home/agent"
+
+# Remote ACP endpoint over WebSocket
+[agent]
+transport = "websocket"
+url = "ws://stdio-to-ws:3000"
+headers = { Authorization = "Bearer ${ACP_TOKEN}" }
+working_dir = "/home/agent"
 ```
 
 ---
@@ -188,7 +200,7 @@ Session pool settings for managing concurrent agent sessions.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `max_sessions` | usize | `10` | Maximum number of concurrent agent sessions. When full, the oldest idle session is suspended (recoverable); if all sessions are busy, new requests are rejected. |
-| `session_ttl_hours` | u64 | `4` | Session time-to-live in hours. Idle sessions are reclaimed after this period. The example config uses `24`. |
+| `session_ttl_hours` | float | `4.0` | Session time-to-live in hours. Supports fractional values such as `0.5` for 30 minutes. Idle sessions are reclaimed after this period. The example config uses `24`. |
 
 ---
 

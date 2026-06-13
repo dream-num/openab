@@ -63,6 +63,15 @@ agents:
     #     trustedBotIds: []
     #     # allowedRoleIds: []  # role IDs that trigger the bot
     #     allowedRoleIds: []
+    #   # ACP transport: "stdio" (default) or "websocket"
+    #   transport: "stdio"
+    #   # stdio transport command + args
+    #   command: claude-agent-acp
+    #   args: []
+    #   # websocket transport endpoint
+    #   # url: ws://stdio-to-ws:3000
+    #   # headers:
+    #   #   Authorization: Bearer ${TOKEN}
     #   workingDir: /home/agent
     #   # nameOverride: custom deployment name (default: <release>-<agentKey>)
     #   nameOverride: ""

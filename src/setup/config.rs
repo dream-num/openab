@@ -39,7 +39,7 @@ struct AgentConfigToml {
 #[derive(serde::Serialize)]
 struct PoolConfigToml {
     max_sessions: usize,
-    session_ttl_hours: u64,
+    session_ttl_hours: f64,
 }
 
 #[derive(serde::Serialize)]
@@ -76,7 +76,7 @@ pub fn generate_config(
     channel_ids: Vec<String>,
     working_dir: &str,
     max_sessions: usize,
-    session_ttl_hours: u64,
+    session_ttl_hours: f64,
 ) -> String {
     let config = ConfigToml {
         discord: DiscordConfigToml {
@@ -137,7 +137,7 @@ mod tests {
             vec!["123".to_string()],
             "/home/agent",
             10,
-            24,
+            24.0,
         );
         assert!(config.contains("[discord]"));
         assert!(config.contains("[agent]"));
@@ -149,7 +149,14 @@ mod tests {
 
     #[test]
     fn generate_config_kiro_working_dir() {
-        let config = generate_config("tok", "kiro", vec!["ch".to_string()], "/home/agent", 10, 24);
+        let config = generate_config(
+            "tok",
+            "kiro",
+            vec!["ch".to_string()],
+            "/home/agent",
+            10,
+            24.0,
+        );
         assert!(config.contains(r#"working_dir = "/home/agent""#));
         assert!(config.contains("acp"));
         assert!(config.contains("--trust-all-tools"));
