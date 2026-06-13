@@ -13,7 +13,8 @@ use serenity::builder::{
     CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateCommandOption,
     CreateInputText, CreateInteractionResponse, CreateInteractionResponseFollowup,
     CreateInteractionResponseMessage, CreateModal, CreateSelectMenu, CreateSelectMenuKind,
-    CreateSelectMenuOption, CreateThread, EditInteractionResponse, EditMessage, GetMessages,
+    CreateSelectMenuOption, CreateThread, EditChannel, EditInteractionResponse, EditMessage,
+    GetMessages,
 };
 use serenity::http::Http;
 use serenity::http::Typing;
@@ -246,6 +247,21 @@ impl ChatAdapter for DiscordAdapter {
                 MessageId::new(msg_id),
                 &ReactionType::Unicode(emoji.to_string()),
             )
+            .await?;
+        Ok(())
+    }
+
+    async fn rename_thread(&self, channel: &ChannelRef, title: &str) -> anyhow::Result<()> {
+        let ch_id: u64 = Self::resolve_channel(channel).parse()?;
+        // Truncate at char boundary to avoid panic on multi-byte chars (中文/Emoji).
+        let truncated: &str = if title.chars().count() > 100 {
+            let end = title.char_indices().nth(100).map(|(i, _)| i).unwrap_or(title.len());
+            &title[..end]
+        } else {
+            title
+        };
+        ChannelId::new(ch_id)
+            .edit(&self.http, EditChannel::new().name(truncated))
             .await?;
         Ok(())
     }
@@ -915,16 +931,51 @@ impl EventHandler for Handler {
             cache.contains_key(&msg.channel_id.to_string())
         };
 
-        self.spawn_agent_turn(
-            adapter,
-            thread_channel,
-            trigger_msg,
-            sender,
-            prompt,
-            extra_blocks,
-            other_bot_present_flag,
-            echo_entries,
-        );
+        // Backfill thread_id: when OAB just created a new thread, the sender
+        // was built before the thread existed. Patch it so the agent sees
+        // thread_id on the very first turn.
+        let mut sender = sender;
+        if sender.thread_id.is_none() && thread_channel.parent_id.is_some() {
+            sender.thread_id = Some(thread_channel.channel_id.clone());
+        }
+
+        let dispatcher = self.dispatcher.clone();
+        let stt_cfg = self.stt_config.clone();
+
+        tokio::spawn(async move {
+            // Best-effort echo before the agent reply so the user can verify STT.
+            crate::stt::post_echo(
+                &adapter,
+                &thread_channel,
+                &trigger_msg,
+                &echo_entries,
+                &stt_cfg,
+            )
+            .await;
+
+            let sender_id = sender.sender_id.clone();
+            let sender_name = sender.sender_name.clone();
+            let sender_json = serde_json::to_string(&sender).unwrap();
+            let thread_key = dispatcher.key("discord", &thread_channel.channel_id, &sender_id);
+            let estimated_tokens = crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
+            let buf_msg = crate::dispatch::BufferedMessage {
+                sender_json,
+                sender_name,
+                prompt,
+                extra_blocks,
+                trigger_msg,
+                arrived_at: std::time::Instant::now(),
+                estimated_tokens,
+                other_bot_present: other_bot_present_flag,
+                recipient: None, // Slack-only (assistant mode); N/A for Discord
+            };
+            if let Err(e) = dispatcher
+                .submit(thread_key, thread_channel, adapter, buf_msg)
+                .await
+            {
+                error!("dispatcher submit error: {e}");
+            }
+        });
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {
@@ -2066,8 +2117,16 @@ impl Handler {
 
         let dispatcher = self.dispatcher.clone();
         let stt_cfg = self.stt_config.clone();
+        let pre_dispatch_typing = adapter.start_typing(&thread_channel);
 
         tokio::spawn(async move {
+            if let Some(typing) = pre_dispatch_typing {
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    typing.stop();
+                });
+            }
+
             crate::stt::post_echo(
                 &adapter,
                 &thread_channel,
@@ -2091,6 +2150,7 @@ impl Handler {
                 arrived_at: std::time::Instant::now(),
                 estimated_tokens,
                 other_bot_present: other_bot_present_flag,
+                recipient: None,
             };
             if let Err(e) = dispatcher
                 .submit(thread_key, thread_channel, adapter, buf_msg)
