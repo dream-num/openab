@@ -10,6 +10,7 @@ use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
 use crate::markdown::{self, TableMode};
 use crate::reactions::StatusReactionController;
+use crate::s3_offload::DiscardedFileOffloader;
 
 pub trait TypingHandle: Send {
     fn stop(self: Box<Self>);
@@ -396,9 +397,12 @@ pub struct AdapterRouter {
     workspace_aliases: std::collections::HashMap<String, String>,
     /// Bot home directory (security boundary for workspace directives).
     bot_home: std::path::PathBuf,
+    /// Optional discarded-file offload handler.
+    discarded_file_offloader: Option<Arc<DiscardedFileOffloader>>,
 }
 
 impl AdapterRouter {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool: Arc<SessionPool>,
         reactions_config: ReactionsConfig,
@@ -407,6 +411,7 @@ impl AdapterRouter {
         liveness_check_secs: u64,
         workspace_aliases: std::collections::HashMap<String, String>,
         bot_home: std::path::PathBuf,
+        discarded_file_offloader: Option<Arc<DiscardedFileOffloader>>,
     ) -> Self {
         if liveness_check_secs >= prompt_hard_timeout_secs {
             warn!(
@@ -425,6 +430,7 @@ impl AdapterRouter {
             liveness_check_interval: std::time::Duration::from_secs(liveness_check_secs),
             workspace_aliases,
             bot_home,
+            discarded_file_offloader,
         }
     }
 
@@ -446,6 +452,10 @@ impl AdapterRouter {
     /// Bot home path for workspace security boundary.
     pub fn bot_home_path(&self) -> std::path::PathBuf {
         self.bot_home.clone()
+    }
+
+    pub fn discarded_file_offloader(&self) -> Option<Arc<DiscardedFileOffloader>> {
+        self.discarded_file_offloader.clone()
     }
 
     /// Pack one arrival event into ContentBlocks. Per-arrival layout:

@@ -255,7 +255,11 @@ impl ChatAdapter for DiscordAdapter {
         let ch_id: u64 = Self::resolve_channel(channel).parse()?;
         // Truncate at char boundary to avoid panic on multi-byte chars (中文/Emoji).
         let truncated: &str = if title.chars().count() > 100 {
-            let end = title.char_indices().nth(100).map(|(i, _)| i).unwrap_or(title.len());
+            let end = title
+                .char_indices()
+                .nth(100)
+                .map(|(i, _)| i)
+                .unwrap_or(title.len());
             &title[..end]
         } else {
             title
@@ -774,6 +778,7 @@ impl EventHandler for Handler {
         let mut extra_blocks = Vec::new();
         let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
         let mut failed_image_files: Vec<String> = Vec::new();
+        let mut pending_offloads: Vec<(String, String, u64)> = Vec::new();
         let mut text_file_bytes: u64 = 0;
         let mut text_file_count: u32 = 0;
         const TEXT_TOTAL_CAP: u64 = 1024 * 1024; // 1 MB total for all text file attachments
@@ -854,7 +859,13 @@ impl EventHandler for Handler {
                         extra_blocks.push(block);
                     }
                     Err(media::MediaFetchError::NotAnImage) => {
-                        if media::is_video_file(
+                        if self.router.discarded_file_offloader().is_some() {
+                            pending_offloads.push((
+                                attachment.url.clone(),
+                                attachment.filename.clone(),
+                                u64::from(attachment.size),
+                            ));
+                        } else if media::is_video_file(
                             &attachment.filename,
                             attachment.content_type.as_deref(),
                         ) {
@@ -875,6 +886,13 @@ impl EventHandler for Handler {
                             "image attachment failed"
                         );
                         failed_image_files.push(attachment.filename.clone());
+                        if self.router.discarded_file_offloader().is_some() {
+                            pending_offloads.push((
+                                attachment.url.clone(),
+                                attachment.filename.clone(),
+                                u64::from(attachment.size),
+                            ));
+                        }
                     }
                 }
             }
@@ -905,6 +923,35 @@ impl EventHandler for Handler {
                 }
             }
         };
+
+        if let Some(offloader) = self.router.discarded_file_offloader() {
+            for (url, filename, size) in pending_offloads {
+                match media::download_attachment_bytes(&url, &filename, size, None).await {
+                    Ok(bytes) => {
+                        let result = offloader
+                            .offload_bytes(&thread_channel, &filename, bytes)
+                            .await;
+                        crate::s3_offload::append_hint_block(&mut extra_blocks, result);
+                    }
+                    Err(e) => {
+                        tracing::warn!(filename = %filename, error = %e, "discarded file download for offload failed");
+                        crate::s3_offload::append_hint_block(
+                            &mut extra_blocks,
+                            crate::s3_offload::OffloadResult {
+                                filename: filename.clone(),
+                                working_path: format!(
+                                    "<unavailable>/{}",
+                                    filename.replace(['/', '\\'], "_")
+                                ),
+                                object_key: String::new(),
+                                uploaded: false,
+                                error: Some(e.to_string()),
+                            },
+                        );
+                    }
+                }
+            }
+        }
 
         // Notify user if any images couldn't be processed.
         if !failed_image_files.is_empty() {
@@ -2100,6 +2147,7 @@ impl Handler {
         Ok(messages)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_agent_turn(
         &self,
         adapter: Arc<dyn ChatAdapter>,

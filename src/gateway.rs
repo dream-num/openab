@@ -714,6 +714,7 @@ pub async fn run_gateway_adapter(
 
                                     // Convert gateway attachments to ContentBlocks
                                     let mut extra_blocks = Vec::new();
+                                    let mut pending_offloads: Vec<(String, Vec<u8>)> = Vec::new();
                                     for att in &event.content.attachments {
                                         // Read bytes: prefer file path (colocate), fallback to base64
                                         let bytes_result = if let Some(ref path) = att.path {
@@ -790,8 +791,15 @@ pub async fn run_gateway_adapter(
                                             }
                                             "audio" => {
                                                 tracing::debug!(filename = %att.filename, "audio attachment skipped — STT not enabled");
+                                                if let Ok(bytes) = bytes_result {
+                                                    pending_offloads.push((att.filename.clone(), bytes));
+                                                }
                                             }
-                                            _ => {}
+                                            _ => {
+                                                if let Ok(bytes) = bytes_result {
+                                                    pending_offloads.push((att.filename.clone(), bytes));
+                                                }
+                                            }
                                         }
                                     }
 
@@ -830,6 +838,7 @@ pub async fn run_gateway_adapter(
                                         }
                                     }
 
+                                    let task_router = router.clone();
                                     tasks.spawn(async move {
                                         // If supergroup with no thread_id, create a forum topic
                                         let thread_channel = if event.channel.channel_type == "supergroup"
@@ -846,6 +855,20 @@ pub async fn run_gateway_adapter(
                                         } else {
                                             channel.clone()
                                         };
+
+                                        if let Some(offloader) =
+                                            task_router.discarded_file_offloader()
+                                        {
+                                            for (filename, bytes) in pending_offloads {
+                                                let result = offloader
+                                                    .offload_bytes(&thread_channel, &filename, bytes)
+                                                    .await;
+                                                crate::s3_offload::append_hint_block(
+                                                    &mut extra_blocks,
+                                                    result,
+                                                );
+                                            }
+                                        }
 
                                         let thread_id = thread_channel
                                             .thread_id

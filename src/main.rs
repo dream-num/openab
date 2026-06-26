@@ -14,6 +14,7 @@ mod markdown;
 mod media;
 mod reactions;
 mod remind;
+mod s3_offload;
 mod secrets;
 mod setup;
 mod slack;
@@ -112,7 +113,11 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         #[cfg(feature = "agentcore")]
-        Commands::AgentcoreBridge { runtime_arn, region, command } => {
+        Commands::AgentcoreBridge {
+            runtime_arn,
+            region,
+            command,
+        } => {
             return acp::agentcore::run_bridge(&runtime_arn, &region, &command).await;
         }
         Commands::Run { config } => config,
@@ -164,6 +169,25 @@ async fn main() -> anyhow::Result<()> {
         cfg = config::parse_config_str(&substituted, &config_source)?;
     }
 
+    let discarded_file_offloader = match cfg.s3.as_ref().and_then(|s3| s3.offload_settings()) {
+        Some(settings) => Some(Arc::new(
+            s3_offload::DiscardedFileOffloader::new(
+                settings,
+                cfg.agent.working_dir.clone(),
+                cfg.agent.per_session_working_dir,
+            )
+            .await,
+        )),
+        None => {
+            if cfg.s3.as_ref().is_some_and(|s3| s3.enabled) {
+                warn!(
+                    "s3.enabled=true but bucket, region, or directory is missing; discarded-file offload disabled"
+                );
+            }
+            None
+        }
+    };
+
     let shutdown_hook = cfg.hooks.pre_shutdown.clone();
 
     let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions));
@@ -199,6 +223,7 @@ async fn main() -> anyhow::Result<()> {
             );
             "/tmp".into()
         })),
+        discarded_file_offloader,
     ));
 
     // Shutdown signal for Slack adapter
@@ -306,6 +331,7 @@ async fn main() -> anyhow::Result<()> {
                 stt,
                 slack_shutdown_rx,
                 slack_dispatcher,
+                router.discarded_file_offloader(),
             )
             .await
             {
