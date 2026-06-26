@@ -138,6 +138,7 @@ pub struct Config {
     pub reactions: ReactionsConfig,
     #[serde(default)]
     pub stt: SttConfig,
+    pub s3: Option<S3Config>,
     #[serde(default)]
     pub markdown: MarkdownConfig,
     #[serde(default)]
@@ -186,9 +187,72 @@ pub struct ExecSecretsConfig {
     pub timeout_seconds: u64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct S3Config {
+    /// Enable discarded-file offload. Defaults to false for backwards compatibility.
+    #[serde(default)]
+    pub enabled: bool,
+    /// S3 bucket name.
+    pub bucket: Option<String>,
+    /// AWS region or S3-compatible region.
+    pub region: Option<String>,
+    /// Optional custom endpoint for S3-compatible storage.
+    pub endpoint_url: Option<String>,
+    /// Force path-style bucket addressing for S3-compatible endpoints.
+    #[serde(default = "default_true")]
+    pub force_path_style: bool,
+    /// Root directory/key prefix under the bucket.
+    pub directory: Option<String>,
+    /// Optional access key for this S3 target.
+    pub access_key_id: Option<String>,
+    /// Optional secret key for this S3 target.
+    pub secret_access_key: Option<String>,
+    /// Optional session token for temporary credentials.
+    pub session_token: Option<String>,
+}
+
+impl S3Config {
+    pub fn offload_settings(&self) -> Option<S3OffloadSettings> {
+        if !self.enabled {
+            return None;
+        }
+        let bucket = non_empty(self.bucket.as_deref())?;
+        let region = non_empty(self.region.as_deref())?;
+        let directory = non_empty(self.directory.as_deref())?;
+        Some(S3OffloadSettings {
+            bucket: bucket.to_string(),
+            region: region.to_string(),
+            endpoint_url: non_empty(self.endpoint_url.as_deref()).map(str::to_string),
+            force_path_style: self.force_path_style,
+            directory: directory.to_string(),
+            access_key_id: non_empty(self.access_key_id.as_deref()).map(str::to_string),
+            secret_access_key: non_empty(self.secret_access_key.as_deref()).map(str::to_string),
+            session_token: non_empty(self.session_token.as_deref()).map(str::to_string),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct S3OffloadSettings {
+    pub bucket: String,
+    pub region: String,
+    pub endpoint_url: Option<String>,
+    pub force_path_style: bool,
+    pub directory: String,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+    pub session_token: Option<String>,
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
 impl Default for ExecSecretsConfig {
     fn default() -> Self {
-        Self { timeout_seconds: 10 }
+        Self {
+            timeout_seconds: 10,
+        }
     }
 }
 
@@ -545,8 +609,8 @@ impl<'de> serde::Deserialize<'de> for AgentConfig {
         // If command was explicitly set but args was not, default args to []
         // to avoid leaking env-var args into a custom command.
         let args = match (cmd_explicit, raw.args) {
-            (_, Some(args)) => args,           // args explicitly set → use them
-            (true, None) => Vec::new(),        // command set, args omitted → empty
+            (_, Some(args)) => args,               // args explicitly set → use them
+            (true, None) => Vec::new(),            // command set, args omitted → empty
             (false, None) => default_agent_args(), // neither set → env var
         };
         Ok(AgentConfig {
@@ -1178,7 +1242,7 @@ headers = { Authorization = "Bearer token" }
             cfg.agent.headers.get("Authorization").map(String::as_str),
             Some("Bearer token")
         );
-        assert!(cfg.agent.command.is_empty());
+        assert_eq!(cfg.agent.command, default_agent_command());
     }
 
     #[test]
@@ -1195,7 +1259,7 @@ transport = "websocket"
     }
 
     #[test]
-    fn stdio_agent_requires_command() {
+    fn stdio_agent_defaults_command() {
         let toml = r#"
 [discord]
 bot_token = "test-token"
@@ -1203,8 +1267,8 @@ bot_token = "test-token"
 [agent]
 transport = "stdio"
 "#;
-        let err = parse_config(toml, "test").unwrap_err().to_string();
-        assert!(err.contains("agent.command is required"));
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(cfg.agent.command, default_agent_command());
     }
 
     #[test]
@@ -1234,6 +1298,72 @@ command = "echo"
         let cfg = parse_config(toml, "test").unwrap();
         assert_eq!(cfg.discord.unwrap().bot_token, "secret-bot-token");
         std::env::remove_var("AB_TEST_TOKEN");
+    }
+
+    #[test]
+    fn s3_config_absent_by_default() {
+        let cfg = parse_config(
+            r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+"#,
+            "test",
+        )
+        .unwrap();
+        assert!(cfg.s3.is_none());
+    }
+
+    #[test]
+    fn s3_config_requires_enabled_and_required_fields() {
+        let cfg = parse_config(
+            r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+
+[s3]
+bucket = "bucket"
+region = "us-east-1"
+directory = "discarded"
+"#,
+            "test",
+        )
+        .unwrap();
+        assert!(cfg.s3.unwrap().offload_settings().is_none());
+
+        let cfg = parse_config(
+            r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+
+[s3]
+enabled = true
+bucket = "bucket"
+region = "us-east-1"
+force_path_style = false
+directory = "discarded"
+access_key_id = "ak"
+secret_access_key = "sk"
+session_token = "token"
+"#,
+            "test",
+        )
+        .unwrap();
+        let settings = cfg.s3.unwrap().offload_settings().unwrap();
+        assert_eq!(settings.bucket, "bucket");
+        assert!(!settings.force_path_style);
+        assert_eq!(settings.directory, "discarded");
+        assert_eq!(settings.access_key_id.as_deref(), Some("ak"));
+        assert_eq!(settings.secret_access_key.as_deref(), Some("sk"));
+        assert_eq!(settings.session_token.as_deref(), Some("token"));
     }
 
     #[test]
@@ -1541,10 +1671,9 @@ runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent
             assert_eq!(cfg.agent.command, "uv");
         }
         assert!(cfg.agent.args.contains(&"--runtime-arn".to_string()));
-        assert!(cfg
-            .agent
-            .args
-            .contains(&"arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent".to_string()));
+        assert!(cfg.agent.args.contains(
+            &"arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent".to_string()
+        ));
     }
 
     #[test]
@@ -1588,7 +1717,9 @@ bot_token = "t"
 runtime_arn = "not-a-valid-arn"
 "#;
         let err = parse_config(toml, "test").unwrap_err();
-        assert!(err.to_string().contains("not a valid AgentCore Runtime ARN"));
+        assert!(err
+            .to_string()
+            .contains("not a valid AgentCore Runtime ARN"));
     }
 
     #[test]
@@ -1601,7 +1732,9 @@ bot_token = "t"
 runtime_arn = "arn:aws:s3:us-east-1:123456789012:bucket/my-bucket"
 "#;
         let err = parse_config(toml, "test").unwrap_err();
-        assert!(err.to_string().contains("not a valid AgentCore Runtime ARN"));
+        assert!(err
+            .to_string()
+            .contains("not a valid AgentCore Runtime ARN"));
     }
 
     #[test]
@@ -1614,7 +1747,9 @@ bot_token = "t"
 runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:agent/my-agent"
 "#;
         let err = parse_config(toml, "test").unwrap_err();
-        assert!(err.to_string().contains("not a valid AgentCore Runtime ARN"));
+        assert!(err
+            .to_string()
+            .contains("not a valid AgentCore Runtime ARN"));
     }
 
     #[test]

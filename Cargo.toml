@@ -36,6 +36,7 @@ chrono-tz = "0.10.4"
 sha2 = "0.10"
 tempfile = "3.27.0"
 aws-sdk-secretsmanager = { version = "1", optional = true }
+aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", optional = true }
 aws-sigv4 = { version = "1", optional = true }
 aws-credential-types = { version = "1", optional = true }
@@ -45,7 +46,7 @@ http = { version = "1", optional = true }
 
 [features]
 default = ["secrets-aws", "agentcore"]
-secrets-aws = ["dep:aws-sdk-secretsmanager", "dep:aws-config"]
+secrets-aws = ["dep:aws-sdk-secretsmanager", "dep:aws-sdk-s3", "dep:aws-config", "dep:aws-credential-types"]
 agentcore = ["dep:aws-config", "dep:aws-sigv4", "dep:aws-credential-types", "dep:urlencoding", "dep:hex", "dep:http", "dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
 
 [target.'cfg(unix)'.dependencies]

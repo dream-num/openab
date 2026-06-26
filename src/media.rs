@@ -294,6 +294,48 @@ pub async fn download_and_encode_image(
     })
 }
 
+/// Download original attachment bytes for discarded-file offload.
+///
+/// This deliberately has a larger cap than image prompt injection because it is
+/// a storage fallback, not a model payload.
+pub async fn download_attachment_bytes(
+    url: &str,
+    filename: &str,
+    size: u64,
+    auth_token: Option<&str>,
+) -> Result<Vec<u8>, MediaFetchError> {
+    const MAX_SIZE: u64 = 100 * 1024 * 1024;
+
+    if size > MAX_SIZE {
+        return Err(MediaFetchError::SizeExceeded {
+            actual: size,
+            limit: MAX_SIZE,
+        });
+    }
+
+    let mut req = HTTP_CLIENT.get(url);
+    if let Some(token) = auth_token {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+    let resp = req.send().await.map_err(MediaFetchError::Network)?;
+    if !resp.status().is_success() {
+        return Err(MediaFetchError::HttpStatus(resp.status()));
+    }
+    let bytes = resp.bytes().await.map_err(MediaFetchError::Network)?;
+    if bytes.len() as u64 > MAX_SIZE {
+        tracing::warn!(
+            filename,
+            size = bytes.len(),
+            "discarded attachment exceeds offload cap"
+        );
+        return Err(MediaFetchError::SizeExceeded {
+            actual: bytes.len() as u64,
+            limit: MAX_SIZE,
+        });
+    }
+    Ok(bytes.to_vec())
+}
+
 /// Download an audio file and transcribe it via the configured STT provider.
 /// Pass `auth_token` for platforms that require authentication.
 pub async fn download_and_transcribe(

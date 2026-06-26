@@ -1210,6 +1210,7 @@ mod tests {
             crate::config::default_liveness_check_secs(),
             std::collections::HashMap::new(),
             std::path::PathBuf::from("/tmp"),
+            None,
         ));
         Dispatcher::with_idle_timeout(router, 10, 24_000, grouping, DEFAULT_CONSUMER_IDLE_TIMEOUT)
     }

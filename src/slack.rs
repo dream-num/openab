@@ -122,7 +122,6 @@ impl SlackAdapter {
         enforce_cache_bounds(&mut cache, self.session_ttl);
     }
 
-
     /// Insert a stream entry, bounding the map so aborted turns (begin without a
     /// matching finish) can't leak unboundedly. Normal lifecycle: stream_begin
     /// inserts, stream_finish removes.
@@ -435,7 +434,8 @@ impl ChatAdapter for SlackAdapter {
             // instead of failing outright.
             Err(e) if is_block_payload_rejected(&e) => {
                 warn!(error = %e, "markdown block rejected; retrying chat.postMessage text-only");
-                let fallback = build_post_message_text_only(&channel.channel_id, thread_ts, content);
+                let fallback =
+                    build_post_message_text_only(&channel.channel_id, thread_ts, content);
                 self.api_post("chat.postMessage", fallback).await?
             }
             Err(e) => return Err(e),
@@ -541,9 +541,7 @@ impl ChatAdapter for SlackAdapter {
         let native = self.assistant_mode && !other_bot_present;
         debug!(
             assistant_mode = self.assistant_mode,
-            other_bot_present,
-            native,
-            "slack assistant_mode decision (per turn)"
+            other_bot_present, native, "slack assistant_mode decision (per turn)"
         );
         native
     }
@@ -574,7 +572,10 @@ impl ChatAdapter for SlackAdapter {
                     if let Some(ts) = resp["ts"].as_str() {
                         self.insert_stream(
                             ts.to_string(),
-                            StreamEntry { active: true, degraded_buf: String::new() },
+                            StreamEntry {
+                                active: true,
+                                degraded_buf: String::new(),
+                            },
                         )
                         .await;
                         return Ok(make_ref(ts.to_string()));
@@ -588,14 +589,20 @@ impl ChatAdapter for SlackAdapter {
         } else {
             // Expected for bot-authored turns (no recipient bound) and non-user
             // triggers, so warn! rather than error! to avoid on-call noise.
-            warn!(thread_ts, "no recipient for turn; falling back to post+edit");
+            warn!(
+                thread_ts,
+                "no recipient for turn; falling back to post+edit"
+            );
         }
 
         // Degraded fallback: plain placeholder via send_message; mark inactive.
         let msg = self.send_message(channel, "…").await?;
         self.insert_stream(
             msg.message_id.clone(),
-            StreamEntry { active: false, degraded_buf: String::new() },
+            StreamEntry {
+                active: false,
+                degraded_buf: String::new(),
+            },
         )
         .await;
         Ok(msg)
@@ -691,6 +698,7 @@ pub async fn run_slack_adapter(
     stt_config: SttConfig,
     mut shutdown_rx: watch::Receiver<bool>,
     dispatcher: Arc<crate::dispatch::Dispatcher>,
+    discarded_file_offloader: Option<Arc<crate::s3_offload::DiscardedFileOffloader>>,
 ) -> Result<()> {
     let bot_token = adapter.bot_token().to_string();
     let bot_turns = Arc::new(tokio::sync::Mutex::new(BotTurnTracker::new(max_bot_turns)));
@@ -786,6 +794,8 @@ pub async fn run_slack_adapter(
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
                                                 let dispatcher = dispatcher.clone();
+                                                let discarded_file_offloader =
+                                                    discarded_file_offloader.clone();
                                                 let team_id = envelope["payload"]["team_id"]
                                                     .as_str()
                                                     .unwrap_or("")
@@ -802,6 +812,7 @@ pub async fn run_slack_adapter(
                                                         &allowed_users,
                                                         &stt_config,
                                                         &dispatcher,
+                                                        discarded_file_offloader,
                                                     )
                                                     .await;
                                                 });
@@ -1024,6 +1035,8 @@ pub async fn run_slack_adapter(
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
                                                 let dispatcher = dispatcher.clone();
+                                                let discarded_file_offloader =
+                                                    discarded_file_offloader.clone();
                                                 tokio::spawn(async move {
                                                     handle_message(
                                                         &event,
@@ -1036,6 +1049,7 @@ pub async fn run_slack_adapter(
                                                         &allowed_users,
                                                         &stt_config,
                                                         &dispatcher,
+                                                        discarded_file_offloader,
                                                     )
                                                     .await;
                                                 });
@@ -1108,6 +1122,7 @@ async fn handle_message(
     allowed_users: &HashSet<String>,
     stt_config: &SttConfig,
     dispatcher: &Arc<crate::dispatch::Dispatcher>,
+    discarded_file_offloader: Option<Arc<crate::s3_offload::DiscardedFileOffloader>>,
 ) {
     let channel_id = match event["channel"].as_str() {
         Some(ch) => ch.to_string(),
@@ -1190,6 +1205,7 @@ async fn handle_message(
     let mut text_file_bytes: u64 = 0;
     let mut text_file_count: u32 = 0;
     let mut failed_image_files: Vec<String> = Vec::new();
+    let mut pending_offloads: Vec<(String, String, u64)> = Vec::new();
 
     if let Some(files) = files {
         for file in files {
@@ -1256,6 +1272,9 @@ async fn handle_message(
                         count = text_file_count,
                         "text file count cap reached, skipping"
                     );
+                    if discarded_file_offloader.clone().is_some() {
+                        pending_offloads.push((url.to_string(), filename.to_string(), size));
+                    }
                     continue;
                 }
                 // Pre-check with Slack-reported size as a fast path when the
@@ -1269,6 +1288,9 @@ async fn handle_message(
                         total = text_file_bytes,
                         "text attachments total exceeds 1MB cap, skipping remaining"
                     );
+                    if discarded_file_offloader.clone().is_some() {
+                        pending_offloads.push((url.to_string(), filename.to_string(), size));
+                    }
                     continue;
                 }
                 if let Some((block, actual_bytes)) =
@@ -1281,12 +1303,17 @@ async fn handle_message(
                             actual = actual_bytes,
                             "text attachments total exceeds 1MB cap after download, dropping file",
                         );
+                        if discarded_file_offloader.clone().is_some() {
+                            pending_offloads.push((url.to_string(), filename.to_string(), size));
+                        }
                         continue;
                     }
                     text_file_bytes += actual_bytes;
                     text_file_count += 1;
                     debug!(filename, "adding text file attachment");
                     extra_blocks.push(block);
+                } else if discarded_file_offloader.clone().is_some() {
+                    pending_offloads.push((url.to_string(), filename.to_string(), size));
                 }
             } else {
                 match media::download_and_encode_image(
@@ -1302,10 +1329,17 @@ async fn handle_message(
                         debug!(filename, "adding image attachment");
                         extra_blocks.push(block);
                     }
-                    Err(media::MediaFetchError::NotAnImage) => {}
+                    Err(media::MediaFetchError::NotAnImage) => {
+                        if discarded_file_offloader.clone().is_some() {
+                            pending_offloads.push((url.to_string(), filename.to_string(), size));
+                        }
+                    }
                     Err(media::MediaFetchError::SizeExceeded { actual, limit }) => {
                         warn!(filename, actual, limit, "image exceeds size limit");
                         failed_image_files.push(filename.to_string());
+                        if discarded_file_offloader.clone().is_some() {
+                            pending_offloads.push((url.to_string(), filename.to_string(), size));
+                        }
                     }
                     Err(
                         media::MediaFetchError::UnsupportedResponseType { .. }
@@ -1316,18 +1350,30 @@ async fn handle_message(
                             "image validation failed; server may have returned non-image content"
                         );
                         failed_image_files.push(filename.to_string());
+                        if discarded_file_offloader.clone().is_some() {
+                            pending_offloads.push((url.to_string(), filename.to_string(), size));
+                        }
                     }
                     Err(media::MediaFetchError::ProcessingFailed(ref e)) => {
                         warn!(filename, error = %e, "image post-processing failed");
                         failed_image_files.push(filename.to_string());
+                        if discarded_file_offloader.clone().is_some() {
+                            pending_offloads.push((url.to_string(), filename.to_string(), size));
+                        }
                     }
                     Err(media::MediaFetchError::HttpStatus(status)) if status.is_client_error() => {
                         warn!(filename, %status, "image download denied");
                         failed_image_files.push(filename.to_string());
+                        if discarded_file_offloader.clone().is_some() {
+                            pending_offloads.push((url.to_string(), filename.to_string(), size));
+                        }
                     }
                     Err(e) => {
                         warn!(filename, error = %e, "image download failed");
                         failed_image_files.push(filename.to_string());
+                        if discarded_file_offloader.clone().is_some() {
+                            pending_offloads.push((url.to_string(), filename.to_string(), size));
+                        }
                     }
                 }
             }
@@ -1398,6 +1444,35 @@ async fn handle_message(
         parent_id: None,
         origin_event_id: None,
     };
+
+    if let Some(offloader) = discarded_file_offloader.clone() {
+        for (url, filename, size) in pending_offloads {
+            match media::download_attachment_bytes(&url, &filename, size, Some(bot_token)).await {
+                Ok(bytes) => {
+                    let result = offloader
+                        .offload_bytes(&thread_channel, &filename, bytes)
+                        .await;
+                    crate::s3_offload::append_hint_block(&mut extra_blocks, result);
+                }
+                Err(e) => {
+                    warn!(filename = %filename, error = %e, "discarded Slack file download for offload failed");
+                    crate::s3_offload::append_hint_block(
+                        &mut extra_blocks,
+                        crate::s3_offload::OffloadResult {
+                            filename: filename.clone(),
+                            working_path: format!(
+                                "<unavailable>/{}",
+                                filename.replace(['/', '\\'], "_")
+                            ),
+                            object_key: String::new(),
+                            uploaded: false,
+                            error: Some(e.to_string()),
+                        },
+                    );
+                }
+            }
+        }
+    }
 
     // Serialize sender context with Slack-native key names so agents calling
     // the Slack API directly see "thread_ts" rather than the generic "thread_id".
@@ -1708,7 +1783,12 @@ fn markdown_to_mrkdwn(text: &str) -> String {
     text.into_owned()
 }
 
-fn build_start_stream_body(channel: &str, thread_ts: &str, user_id: &str, team_id: &str) -> serde_json::Value {
+fn build_start_stream_body(
+    channel: &str,
+    thread_ts: &str,
+    user_id: &str,
+    team_id: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "channel": channel,
         "thread_ts": thread_ts,
@@ -1766,13 +1846,27 @@ mod tests {
 
     #[tokio::test]
     async fn degraded_stream_append_accumulates() {
-        let adapter = SlackAdapter::new("xoxb-test".into(), std::time::Duration::from_secs(60), AllowBots::Off, true);
+        let adapter = SlackAdapter::new(
+            "xoxb-test".into(),
+            std::time::Duration::from_secs(60),
+            AllowBots::Off,
+            true,
+        );
         adapter.streams.lock().await.insert(
             "TS".into(),
-            StreamEntry { active: false, degraded_buf: String::new() },
+            StreamEntry {
+                active: false,
+                degraded_buf: String::new(),
+            },
         );
-        assert_eq!(adapter.accumulate_degraded("TS", "a").await.as_deref(), Some("a"));
-        assert_eq!(adapter.accumulate_degraded("TS", "b").await.as_deref(), Some("ab"));
+        assert_eq!(
+            adapter.accumulate_degraded("TS", "a").await.as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            adapter.accumulate_degraded("TS", "b").await.as_deref(),
+            Some("ab")
+        );
         // missing stream is not resurrected:
         assert_eq!(adapter.accumulate_degraded("MISSING", "x").await, None);
     }
@@ -2098,15 +2192,33 @@ mod tests {
         // assistant_mode=true → status API on; native streaming on (no other bot),
         // off when another bot is present; post+edit streaming on regardless.
         let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, true);
-        assert!(adapter.uses_assistant_status(), "assistant_mode enables status API");
-        assert!(adapter.use_streaming(false), "post+edit streaming on when no other bot");
-        assert!(adapter.uses_native_streaming(false), "native streaming on when no other bot");
-        assert!(!adapter.uses_native_streaming(true), "other bot present disables native");
+        assert!(
+            adapter.uses_assistant_status(),
+            "assistant_mode enables status API"
+        );
+        assert!(
+            adapter.use_streaming(false),
+            "post+edit streaming on when no other bot"
+        );
+        assert!(
+            adapter.uses_native_streaming(false),
+            "native streaming on when no other bot"
+        );
+        assert!(
+            !adapter.uses_native_streaming(true),
+            "other bot present disables native"
+        );
         // assistant_mode=false → no status API, no native streaming; post+edit still streams.
         let adapter2 = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Off, false);
         assert!(!adapter2.uses_assistant_status());
-        assert!(adapter2.use_streaming(false), "post+edit streaming independent of assistant_mode");
-        assert!(!adapter2.uses_native_streaming(false), "native streaming requires assistant_mode");
+        assert!(
+            adapter2.use_streaming(false),
+            "post+edit streaming independent of assistant_mode"
+        );
+        assert!(
+            !adapter2.uses_native_streaming(false),
+            "native streaming requires assistant_mode"
+        );
     }
 
     /// chat.postMessage body carries Block Kit `markdown` blocks with the raw
@@ -2119,7 +2231,10 @@ mod tests {
         assert_eq!(b["blocks"][0]["type"], "markdown");
         // Raw markdown preserved — heading is NOT flattened to `*Heading*`.
         assert_eq!(b["blocks"][0]["text"], "## Heading\n- item");
-        assert!(b["text"].is_string(), "text fallback present for a11y/notifs");
+        assert!(
+            b["text"].is_string(),
+            "text fallback present for a11y/notifs"
+        );
     }
 
     /// thread_ts is omitted (top-level post) when the channel has no thread.
@@ -2212,7 +2327,9 @@ mod tests {
         // Exact error-code match, not substring: a future code that merely
         // contains `invalid_blocks` must NOT trigger a text-only retry.
         assert!(
-            !is_block_payload_rejected(&anyhow!("Slack API chat.postMessage: invalid_blocks_field")),
+            !is_block_payload_rejected(&anyhow!(
+                "Slack API chat.postMessage: invalid_blocks_field"
+            )),
             "must match the error code exactly, not as a substring"
         );
     }

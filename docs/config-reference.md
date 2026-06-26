@@ -114,6 +114,51 @@ The AI agent subprocess that OpenAB spawns to handle messages via ACP.
 
 > **Default inherited vars:** After `env_clear()`, the agent always receives `HOME`, `PATH`, and `USER` (on Windows: `USERPROFILE`, `USERNAME`, `PATH`, `SystemRoot`, `SystemDrive`). Use `inherit_env` to pass additional vars beyond this baseline.
 
+## S3 Discarded File Offload
+
+OpenAB can upload files that were not injected into the prompt, such as unsupported file types or files skipped by size limits. This is disabled by default; existing deployments keep the same discard behavior unless `[s3] enabled = true` is configured with the required fields.
+
+```toml
+[s3]
+enabled = true
+bucket = "openab-discarded-files"
+region = "us-east-1"
+directory = "discarded"
+access_key_id = "${S3_ACCESS_KEY_ID}"
+secret_access_key = "${S3_SECRET_ACCESS_KEY}"
+# endpoint_url = "http://minio:9000"
+# force_path_style = true
+# session_token = "${S3_SESSION_TOKEN}"
+```
+
+For Aliyun OSS S3-compatible endpoints, use virtual-hosted style:
+
+```toml
+[s3]
+enabled = true
+bucket = "univer-cli-fc-east"
+region = "us-east-1"
+endpoint_url = "https://s3.oss-us-east-1.aliyuncs.com"
+force_path_style = false
+directory = "/slack-test/data/"
+access_key_id = "${OSS_ACCESS_KEY_ID}"
+secret_access_key = "${OSS_ACCESS_KEY_SECRET}"
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enables discarded-file uploads when the required fields are also valid. |
+| `bucket` | string | — | Destination S3 bucket. Required when enabled. |
+| `region` | string | — | AWS region or S3-compatible region. Required when enabled. |
+| `endpoint_url` | string | — | Optional S3-compatible endpoint, such as MinIO or LocalStack. |
+| `force_path_style` | bool | `true` | Use path-style bucket addressing (`endpoint/bucket/key`). Set to `false` for providers such as Aliyun OSS that require virtual-hosted style (`bucket.endpoint/key`). |
+| `directory` | string | — | Root key prefix for discarded files. Required when enabled. Use nested paths such as `prod/openab/discarded` for environment or tenant isolation. |
+| `access_key_id` | string | AWS SDK default chain | Optional access key for this S3 target. When omitted, OpenAB uses the AWS SDK default credential chain. |
+| `secret_access_key` | string | AWS SDK default chain | Optional secret key for this S3 target. Used only when `access_key_id` is also set. |
+| `session_token` | string | — | Optional session token for temporary credentials. |
+
+Object keys are rooted at `directory`; when `agent.per_session_working_dir = true`, they also include the sanitized session directory. Prompt hints include `discarded-file-offload`, the logical working path under `agent.working_dir`, and the object key.
+
 ### Authentication
 
 Each image sets `OPENAB_AGENT_AUTH_COMMAND` with the correct auth command. To authenticate any agent:

@@ -709,6 +709,7 @@ mod tests {
 
     #[test]
     fn resolve_working_dir_uses_base_dir_by_default() {
+        let tmp = tempfile::tempdir().expect("tempdir");
         let pool = SessionPool::new(
             AgentConfig {
                 transport: AgentTransport::Stdio,
@@ -716,10 +717,11 @@ mod tests {
                 args: vec![],
                 url: None,
                 headers: HashMap::new(),
-                working_dir: "/tmp/openab-working-dir".into(),
+                working_dir: tmp.path().to_string_lossy().into_owned(),
                 per_session_working_dir: false,
                 env: HashMap::new(),
                 inherit_env: vec![],
+                command_explicit: true,
             },
             1,
         );
@@ -727,7 +729,7 @@ mod tests {
         let resolved = pool
             .resolve_working_dir("discord:123")
             .expect("resolve default working dir");
-        assert_eq!(resolved, "/tmp/openab-working-dir");
+        assert_eq!(PathBuf::from(resolved), tmp.path());
     }
 
     #[test]
@@ -744,6 +746,7 @@ mod tests {
                 per_session_working_dir: true,
                 env: HashMap::new(),
                 inherit_env: vec![],
+                command_explicit: true,
             },
             1,
         );
@@ -770,6 +773,7 @@ mod tests {
                 per_session_working_dir: false,
                 env: HashMap::new(),
                 inherit_env: vec![],
+                command_explicit: true,
             },
             1,
         );
@@ -794,6 +798,7 @@ mod tests {
                 per_session_working_dir: false,
                 env: HashMap::new(),
                 inherit_env: vec![],
+                command_explicit: false,
             },
             1,
         );
@@ -820,6 +825,7 @@ mod tests {
                 per_session_working_dir: true,
                 env: HashMap::new(),
                 inherit_env: vec![],
+                command_explicit: false,
             },
             1,
         );
